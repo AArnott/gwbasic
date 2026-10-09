@@ -277,6 +277,14 @@ struct CommonKeep {
     arrays: Vec<(Name, Array)>,
 }
 
+struct ChainKeep {
+    vars: CommonKeep,
+    fns: Option<HashMap<Name, UserFn>>,
+    defs: Option<[Ty; 26]>,
+    base: i16,
+    base_locked: bool,
+}
+
 #[derive(Clone)]
 struct UserFn {
     params: Vec<Ident>,
@@ -1095,10 +1103,10 @@ fn walk(
         "WRITE" => exec_write(parser, mode, ctx.as_mut()),
         "OPEN" => exec_open(parser, mode, ctx.as_mut()),
         "CLOSE" => exec_close(parser, mode, ctx.as_mut()),
-        "LOAD" => exec_load(parser, mode, ctx.as_mut(), false),
+        "LOAD" => exec_load(parser, mode, ctx.as_mut()),
         "MERGE" => exec_merge(parser, mode, ctx.as_mut()),
         "SAVE" => exec_save(parser, mode, ctx.as_mut()),
-        "CHAIN" => exec_load(parser, mode, ctx.as_mut(), true),
+        "CHAIN" => exec_chain(parser, mode, ctx.as_mut()),
         "KILL" => exec_kill(parser, mode, ctx.as_mut()),
         "NAME" => exec_name(parser, mode, ctx.as_mut()),
         "FILES" => exec_files(parser, mode, ctx.as_mut()),
@@ -3605,7 +3613,7 @@ fn exec_def_fn(
     mode: Mode,
     ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
 ) -> Result<Flow, RunErr> {
-    parser.bump();
+    // `DEF` was already consumed. `FNA` is the keyword `FN` plus the name.
     expect_word(parser, "FN")?;
     let ident = take_ident(parser)?;
     let mut params = Vec::new();
@@ -4530,17 +4538,13 @@ fn exec_load(
     parser: &mut Parser<'_>,
     mode: Mode,
     ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
-    chain: bool,
 ) -> Result<Flow, RunErr> {
     parser.bump();
     let name = parse_expr(parser)?;
-    let mut run = chain;
-    let mut start = None;
+    let mut run = false;
     if matches!(parser.cur, Tok::Punct(b',')) {
         parser.bump();
-        if chain && is_line_ref(&parser.cur) {
-            start = Some(parse_line_ref(parser)?);
-        } else if !chain && name_is(&parser.cur, "R") {
+        if name_is(&parser.cur, "R") {
             parser.bump();
             run = true;
         } else {
@@ -4555,30 +4559,199 @@ fn exec_load(
     let path = files::bas_path(&name).map_err(file_fault)?;
     let bytes = files::read_bytes(&path).map_err(file_fault)?;
     load_bytes(ctx.1.program, &bytes).map_err(file_fault)?;
-    let saved = if chain {
-        Some(snapshot_common(ctx.0))
-    } else {
-        None
-    };
-    let start = match start {
-        Some(dest) => match dest {
-            LineRef::Num(n) => Some(n),
-            LineRef::Dot => ctx.1.program.last,
-        },
-        None => None,
-    };
     if run {
-        let started = begin_program(ctx.0, ctx.1.program, start);
-        if let Some(saved) = saved {
-            restore_common(ctx.0, saved);
-        }
-        if started {
+        if begin_program(ctx.0, ctx.1.program, None) {
             return Ok(Flow::Jump(ctx.0.ip));
         }
     } else {
         ctx.0.reset_runtime();
     }
     Ok(Flow::Ended)
+}
+
+fn exec_chain(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let merge = if parser.cur.is("MERGE") {
+        parser.bump();
+        true
+    } else {
+        false
+    };
+    let name = parse_expr(parser)?;
+    let mut start_expr = None;
+    let mut all = false;
+    let mut delete = None;
+    let mut ignore = None;
+    if matches!(parser.cur, Tok::Punct(b',')) {
+        parser.bump();
+        if !chain_slot_empty(&parser.cur) {
+            start_expr = Some(parse_expr(parser)?);
+        }
+        if matches!(parser.cur, Tok::Punct(b',')) {
+            parser.bump();
+            if name_is(&parser.cur, "ALL") {
+                parser.bump();
+                all = true;
+                if matches!(parser.cur, Tok::Punct(b',')) {
+                    parser.bump();
+                    expect_word(parser, "DELETE")?;
+                    delete = Some(parse_delete_range(parser)?);
+                    if matches!(parser.cur, Tok::Punct(b',')) {
+                        parser.bump();
+                        ignore = Some(parse_expr(parser)?);
+                    }
+                }
+            } else if parser.cur.is("DELETE") {
+                parser.bump();
+                delete = Some(parse_delete_range(parser)?);
+                if matches!(parser.cur, Tok::Punct(b',')) {
+                    parser.bump();
+                    ignore = Some(parse_expr(parser)?);
+                }
+            } else {
+                return Err(fault(SYNTAX, 2));
+            }
+        }
+    }
+    if !terminated(&parser.cur) {
+        return Err(fault(SYNTAX, 2));
+    }
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let name = eval_string(ctx.0, ctx.1, &name)?;
+    let start = match &start_expr {
+        Some(expr) => Some(chain_line_number(&eval_expr(ctx.0, ctx.1, expr)?)?),
+        None => None,
+    };
+    if let Some(expr) = &ignore {
+        let _ = eval_expr(ctx.0, ctx.1, expr)?;
+    }
+    if merge && ctx.1.program.is_protected() {
+        return Err(fault(ILLEGAL, 5));
+    }
+    let path = files::bas_path(&name).map_err(file_fault)?;
+    let bytes = files::read_bytes(&path).map_err(file_fault)?;
+    if merge && matches!(bytes.first(), Some(0xFF | 0xFE)) {
+        return Err(fault(files::BAD_FILE_MODE, 54));
+    }
+    if merge {
+        let mut scratch = ctx.1.program.clone();
+        if let Some((range_start, range_end)) = delete {
+            let end = endpoint_number(&scratch, range_end)?;
+            if !scratch.contains(end) {
+                return Err(fault(ILLEGAL, 5));
+            }
+            let start_n = match range_start {
+                Some(endpoint) => Some(endpoint_number(&scratch, endpoint)?),
+                None => None,
+            };
+            scratch.delete_range(start_n, Some(end));
+        }
+        load_ascii(&mut scratch, &files::decode_ascii(&bytes), false).map_err(file_fault)?;
+        *ctx.1.program = scratch;
+    } else {
+        if let Some((_, range_end)) = delete {
+            let end = endpoint_number(ctx.1.program, range_end)?;
+            if !ctx.1.program.contains(end) {
+                return Err(fault(ILLEGAL, 5));
+            }
+        }
+        load_bytes(ctx.1.program, &bytes).map_err(file_fault)?;
+    }
+    let keep = snapshot_chain(ctx.0, all, merge);
+    if let Some(line) = start {
+        if !ctx.1.program.contains(line) {
+            ctx.0.reset_runtime();
+            restore_chain(ctx.0, keep);
+            ctx.0.phase = Phase::Idle;
+            return Err(fault(ILLEGAL, 5));
+        }
+    }
+    let started = begin_program(ctx.0, ctx.1.program, start);
+    restore_chain(ctx.0, keep);
+    if started {
+        Ok(Flow::Jump(ctx.0.ip))
+    } else {
+        Ok(Flow::Ended)
+    }
+}
+
+fn chain_slot_empty(tok: &Tok) -> bool {
+    terminated(tok) || matches!(tok, Tok::Punct(b',')) || name_is(tok, "ALL") || tok.is("DELETE")
+}
+
+#[derive(Clone, Copy)]
+enum LineEndpoint {
+    Num(u16),
+    Dot,
+}
+
+fn parse_delete_range(
+    parser: &mut Parser<'_>,
+) -> Result<(Option<LineEndpoint>, LineEndpoint), RunErr> {
+    let start = if parser.cur.is("-") {
+        None
+    } else {
+        Some(parse_line_endpoint(parser)?)
+    };
+    if parser.cur.is("-") {
+        parser.bump();
+        return Ok((start, parse_line_endpoint(parser)?));
+    }
+    match start {
+        Some(end) => Ok((Some(end), end)),
+        None => Err(fault(SYNTAX, 2)),
+    }
+}
+
+fn parse_line_endpoint(parser: &mut Parser<'_>) -> Result<LineEndpoint, RunErr> {
+    if matches!(parser.cur, Tok::Punct(b'.')) {
+        parser.bump();
+        return Ok(LineEndpoint::Dot);
+    }
+    let n = match &parser.cur {
+        Tok::Int(n) if *n >= 0 => u32::from(*n as u16),
+        Tok::Int(_) => return Err(fault(ILLEGAL, 5)),
+        Tok::Hex(n) | Tok::Oct(n) | Tok::Line(n) => u32::from(*n),
+        Tok::Single(m) | Tok::Double(m) => whole_line_number(*m)?,
+        _ => return Err(fault(SYNTAX, 2)),
+    };
+    parser.bump();
+    if n > 65529 {
+        return Err(fault(SYNTAX, 2));
+    }
+    Ok(LineEndpoint::Num(n as u16))
+}
+
+fn endpoint_number(program: &Program, endpoint: LineEndpoint) -> Result<u16, RunErr> {
+    match endpoint {
+        LineEndpoint::Num(n) => Ok(n),
+        LineEndpoint::Dot => program.last.ok_or_else(|| fault(ILLEGAL, 5)),
+    }
+}
+
+fn chain_line_number(value: &Value) -> Result<u16, RunErr> {
+    let number = to_mbf(value_num(value)?, true)?;
+    let rounded = number.to_f64();
+    if !rounded.is_finite() || rounded.fract() != 0.0 {
+        return Err(fault(ILLEGAL, 5));
+    }
+    if rounded < 0.0 {
+        if !(-32768.0..=-1.0).contains(&rounded) {
+            return Err(fault(OVERFLOW, 6));
+        }
+        return Ok((rounded as i16) as u16);
+    }
+    if rounded > 65535.0 {
+        return Err(fault(OVERFLOW, 6));
+    }
+    Ok(rounded as u16)
 }
 
 fn exec_merge(
@@ -5309,4 +5482,42 @@ fn restore_common(vm: &mut Vm, saved: CommonKeep) {
     for (name, array) in saved.arrays {
         vm.arrays.insert(name, array);
     }
+}
+
+fn snapshot_chain(vm: &Vm, all: bool, merge: bool) -> ChainKeep {
+    let vars = if all {
+        CommonKeep {
+            scalars: vm
+                .scalars
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            arrays: vm
+                .arrays
+                .iter()
+                .map(|(name, array)| (name.clone(), array.clone()))
+                .collect(),
+        }
+    } else {
+        snapshot_common(vm)
+    };
+    ChainKeep {
+        vars,
+        fns: if all { Some(vm.fns.clone()) } else { None },
+        defs: if merge { Some(vm.defs) } else { None },
+        base: vm.base,
+        base_locked: vm.base_locked,
+    }
+}
+
+fn restore_chain(vm: &mut Vm, saved: ChainKeep) {
+    restore_common(vm, saved.vars);
+    if let Some(fns) = saved.fns {
+        vm.fns = fns;
+    }
+    if let Some(defs) = saved.defs {
+        vm.defs = defs;
+    }
+    vm.base = saved.base;
+    vm.base_locked = saved.base_locked;
 }

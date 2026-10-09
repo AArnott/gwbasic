@@ -986,6 +986,10 @@ fn boundary(src: &[u8], next: usize, name: &str) -> bool {
     if glued {
         return true;
     }
+    // `FNA` is the user function `FN` plus the name `A`.
+    if name == "FN" {
+        return true;
+    }
     next >= src.len() || !src[next].is_ascii_alphanumeric()
 }
 

@@ -1858,4 +1858,162 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn chain_merge_starts_at_a_line_and_can_keep_everything() {
+        let dir = std::env::temp_dir().join("gwbasic-milestone6");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let later = dir.join("LATER.BAS");
+        std::fs::write(&later, "10 PRINT \"NO\"\n100 PRINT \"YES\"\n").unwrap();
+        let mut start = fresh();
+        start.type_ascii(&format!("10 CHAIN \"{}\", 100\nRUN\n", later.display()));
+        let snap = start.snapshot();
+        assert!(snap.lines().any(|line| line == "YES"), "{snap}");
+        assert!(!snap.lines().any(|line| line == "NO"), "{snap}");
+
+        let only = dir.join("ONLY.BAS");
+        std::fs::write(&only, "10 PRINT \"LOADED\"\n").unwrap();
+        let mut missing = fresh();
+        missing.type_ascii(&format!("10 CHAIN \"{}\", 50\nRUN\nLIST\n", only.display()));
+        let snap = missing.snapshot();
+        assert!(snap.contains(ILLEGAL), "{snap}");
+        assert!(
+            snap.lines().any(|line| line == "10 PRINT \"LOADED\""),
+            "{snap}"
+        );
+
+        let overlay = dir.join("ADD.BAS");
+        std::fs::write(&overlay, "15 PRINT \"ADD\"\n").unwrap();
+        let mut merged = fresh();
+        merged.type_ascii(&format!(
+            "10 PRINT \"KEEP\"\n20 CHAIN MERGE \"{}\", 15, DELETE 20-40\n40 PRINT \"DROP\"\nRUN\nLIST\n",
+            overlay.display()
+        ));
+        let snap = merged.snapshot();
+        assert!(snap.lines().any(|line| line == "KEEP"), "{snap}");
+        assert!(snap.lines().any(|line| line == "ADD"), "{snap}");
+        assert!(!snap.lines().any(|line| line == "DROP"), "{snap}");
+        assert_eq!(
+            snap.lines()
+                .filter(|line| *line == "15 PRINT \"ADD\"")
+                .count(),
+            1,
+            "{snap}"
+        );
+        assert_eq!(
+            snap.lines()
+                .filter(|line| *line == "40 PRINT \"DROP\"")
+                .count(),
+            1,
+            "{snap}"
+        );
+        assert!(snap.contains("Ok"), "{snap}");
+
+        let replaced = dir.join("NEW.BAS");
+        std::fs::write(&replaced, "10 PRINT \"NEW\"\n").unwrap();
+        let mut untouched = fresh();
+        untouched.type_ascii(&format!(
+            "10 PRINT \"OLD\"\n20 CHAIN MERGE \"{}\",,DELETE 50-90\nRUN\nLIST\n",
+            replaced.display()
+        ));
+        let snap = untouched.snapshot();
+        assert!(snap.contains(ILLEGAL), "{snap}");
+        assert!(snap.lines().any(|line| line == "OLD"), "{snap}");
+        assert!(!snap.lines().any(|line| line == "NEW"), "{snap}");
+        assert!(
+            snap.lines().any(|line| line.contains("CHAIN MERGE")),
+            "{snap}"
+        );
+
+        let tokenized = dir.join("TOK.BAS");
+        std::fs::write(&tokenized, [0xFF]).unwrap();
+        let mut binary = fresh();
+        binary.type_ascii(&format!(
+            "10 PRINT \"SAFE\"\n20 CHAIN MERGE \"{}\"\nRUN\nLIST\n",
+            tokenized.display()
+        ));
+        let snap = binary.snapshot();
+        assert!(snap.contains("Bad file mode"), "{snap}");
+        assert!(snap.lines().any(|line| line == "SAFE"), "{snap}");
+        assert!(
+            snap.lines().any(|line| line.contains("CHAIN MERGE")),
+            "{snap}"
+        );
+
+        let passed = dir.join("ALL.BAS");
+        std::fs::write(&passed, "10 PRINT B\n").unwrap();
+        let mut keep = fresh();
+        keep.type_ascii(&format!(
+            "10 B=9\n20 CHAIN \"{}\",,ALL\nRUN\n",
+            passed.display()
+        ));
+        assert!(
+            keep.snapshot().lines().any(|line| line == " 9"),
+            "{}",
+            keep.snapshot()
+        );
+
+        let based = dir.join("BASE.BAS");
+        std::fs::write(&based, "10 DIM A(1)\n20 PRINT A(0)\n").unwrap();
+        let mut base = fresh();
+        base.type_ascii(&format!(
+            "10 OPTION BASE 1\n20 CHAIN \"{}\"\nRUN\n",
+            based.display()
+        ));
+        assert!(
+            base.snapshot().contains("Subscript out of range"),
+            "{}",
+            base.snapshot()
+        );
+
+        let typed = dir.join("INT.BAS");
+        std::fs::write(&typed, "10 A=3/2\n20 PRINT A\n").unwrap();
+        let mut ints = fresh();
+        ints.type_ascii(&format!(
+            "10 DEFINT A\n20 CHAIN MERGE \"{}\",,ALL\nRUN\n",
+            typed.display()
+        ));
+        assert!(
+            ints.snapshot().lines().any(|line| line == " 2"),
+            "{}",
+            ints.snapshot()
+        );
+        let mut singles = fresh();
+        singles.type_ascii(&format!(
+            "10 DEFINT A\n20 CHAIN \"{}\",,ALL\nRUN\n",
+            typed.display()
+        ));
+        assert!(
+            singles.snapshot().lines().any(|line| line == " 1.5"),
+            "{}",
+            singles.snapshot()
+        );
+
+        let func = dir.join("FN.BAS");
+        std::fs::write(&func, "10 PRINT FNA(2)\n").unwrap();
+        let mut kept_fn = fresh();
+        kept_fn.type_ascii(&format!(
+            "10 DEF FNA(X)=X+1\n20 CHAIN \"{}\",,ALL\nRUN\n",
+            func.display()
+        ));
+        assert!(
+            kept_fn.snapshot().lines().any(|line| line == " 3"),
+            "{}",
+            kept_fn.snapshot()
+        );
+        let mut lost_fn = fresh();
+        lost_fn.type_ascii(&format!(
+            "10 DEF FNA(X)=X+1\n20 CHAIN \"{}\"\nRUN\n",
+            func.display()
+        ));
+        assert!(
+            lost_fn.snapshot().contains("Undefined user function"),
+            "{}",
+            lost_fn.snapshot()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
