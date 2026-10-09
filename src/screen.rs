@@ -1,10 +1,48 @@
 //! The GW-BASIC screen. There is no separate line buffer: the cells on the
 //! screen are the line. A logical line is one or more physical rows joined by
 //! a continuation flag, at most 255 characters.
+//!
+//! Graphics modes keep an attribute framebuffer beside that text grid. The
+//! window composites the text over the pixels; `POINT` reads the buffer.
 
 pub const SCREEN_ROWS: usize = 25;
 pub const MAX_LOGICAL: usize = 255;
 pub const ATTR_NORMAL: u8 = 0x07;
+
+/// The 16-colour EGA palette, also used for text attributes.
+pub const EGA16: [u32; 16] = [
+    0x000000, 0x0000AA, 0x00AA00, 0x00AAAA, 0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA, 0x555555,
+    0x5555FF, 0x55FF55, 0x55FFFF, 0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF,
+];
+
+/// `SCREEN 9` default attribute registers. Index 20 is brown, so attribute 6
+/// stays brown instead of becoming yellow.
+const EGA64_DEFAULT: [u16; 16] = [0, 1, 2, 3, 4, 5, 20, 7, 56, 57, 58, 59, 60, 61, 62, 63];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GfxErr {
+    Illegal,
+    Overflow,
+}
+
+/// Arguments of `SCREEN [mode][,[burst][,[apage][,[vpage]]]]`.
+/// `erase` is the PCjr/Tandy fifth argument, which this machine rejects.
+#[derive(Clone, Copy, Debug)]
+pub struct ScreenArgs {
+    pub mode: Option<i16>,
+    pub burst: Option<i16>,
+    pub active: Option<i16>,
+    pub visible: Option<i16>,
+    pub erase: bool,
+}
+
+/// `COLOR` in a graphics mode. Omitted arguments are `None`.
+#[derive(Clone, Copy, Debug)]
+pub struct ColorArgs {
+    pub foreground: Option<i16>,
+    pub palette_0: Option<i16>,
+    pub extra: Option<i16>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
@@ -27,6 +65,7 @@ pub struct Screen {
     insert: bool,
     keys_on: bool,
     attr: u8,
+    gfx: Gfx,
 }
 
 impl Screen {
@@ -40,6 +79,7 @@ impl Screen {
             insert: false,
             keys_on: true,
             attr: ATTR_NORMAL,
+            gfx: Gfx::text(),
         };
         screen.rows = (0..SCREEN_ROWS).map(|_| screen.blank_row()).collect();
         screen
@@ -102,6 +142,14 @@ impl Screen {
     }
 
     pub fn clear(&mut self) {
+        self.clear_text();
+        if self.gfx.mode != 0 {
+            self.gfx.pixels.fill(0);
+            self.gfx.reset_pen();
+        }
+    }
+
+    fn clear_text(&mut self) {
         let blank = self.blank_row();
         let editable = self.editable_rows();
         for row in &mut self.rows[..editable] {
@@ -119,6 +167,9 @@ impl Screen {
     pub fn set_width(&mut self, width: usize) -> bool {
         if width != 40 && width != 80 {
             return false;
+        }
+        if self.gfx.mode != 0 {
+            return self.set_graphics_width(width);
         }
         self.width = width;
         self.rows = (0..SCREEN_ROWS).map(|_| self.blank_row()).collect();
@@ -662,6 +713,29 @@ impl Screen {
         let col = idx % self.width;
         self.rows[row].cells[col].ch
     }
+
+    fn set_graphics_width(&mut self, width: usize) -> bool {
+        let next = match (self.gfx.mode, width) {
+            (1, 80) => 2,
+            (2, 40) => 1,
+            (7, 80) => 8,
+            (8, 40) => 7,
+            (9, 40) => 7,
+            (1, 40)
+            | (2, 80)
+            | (7, 40)
+            | (8, 80)
+            | (9, 80)
+            | (10, 80)
+            | (11, 80)
+            | (12, 80)
+            | (13, 40) => return true,
+            _ => return false,
+        };
+        self.enter(next, self.gfx.colorburst, true);
+        self.insert = false;
+        true
+    }
 }
 
 fn is_word(b: u8) -> bool {
@@ -670,6 +744,800 @@ fn is_word(b: u8) -> bool {
 
 fn bytes_to_string(bytes: &[u8]) -> String {
     bytes.iter().copied().map(char::from).collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColorKind {
+    Text,
+    /// `SCREEN 1`. Attribute 0 can be a 64-colour value; the other three follow the CGA palette.
+    Cga,
+    /// `SCREEN 2` and `SCREEN 11`. `COLOR` is illegal.
+    Mono2,
+    /// `SCREEN 7` and `SCREEN 8`. `COLOR`'s background is taken modulo 8.
+    Ega16Mod,
+    /// `SCREEN 12`. Sixteen colours, no modulo.
+    Ega16,
+    /// `SCREEN 9`.
+    Ega64,
+    /// `SCREEN 10`. Foreground is 1..=3.
+    Mono4,
+    /// `SCREEN 13`.
+    Vga,
+}
+
+#[derive(Clone, Copy)]
+struct ModeSpec {
+    w: usize,
+    h: usize,
+    cols: usize,
+    colors: usize,
+    fg: u8,
+    kind: ColorKind,
+}
+
+fn mode_spec(mode: u8) -> Option<ModeSpec> {
+    Some(match mode {
+        1 => ModeSpec {
+            w: 320,
+            h: 200,
+            cols: 40,
+            colors: 16,
+            fg: 3,
+            kind: ColorKind::Cga,
+        },
+        2 => ModeSpec {
+            w: 640,
+            h: 200,
+            cols: 80,
+            colors: 16,
+            fg: 1,
+            kind: ColorKind::Mono2,
+        },
+        7 => ModeSpec {
+            w: 320,
+            h: 200,
+            cols: 40,
+            colors: 16,
+            fg: 15,
+            kind: ColorKind::Ega16Mod,
+        },
+        8 => ModeSpec {
+            w: 640,
+            h: 200,
+            cols: 80,
+            colors: 16,
+            fg: 15,
+            kind: ColorKind::Ega16Mod,
+        },
+        9 => ModeSpec {
+            w: 640,
+            h: 350,
+            cols: 80,
+            colors: 64,
+            fg: 15,
+            kind: ColorKind::Ega64,
+        },
+        10 => ModeSpec {
+            w: 640,
+            h: 350,
+            cols: 80,
+            colors: 16,
+            fg: 3,
+            kind: ColorKind::Mono4,
+        },
+        11 => ModeSpec {
+            w: 640,
+            h: 480,
+            cols: 80,
+            colors: 16,
+            fg: 1,
+            kind: ColorKind::Mono2,
+        },
+        12 => ModeSpec {
+            w: 640,
+            h: 480,
+            cols: 80,
+            colors: 16,
+            fg: 15,
+            kind: ColorKind::Ega16,
+        },
+        13 => ModeSpec {
+            w: 320,
+            h: 200,
+            cols: 40,
+            colors: 256,
+            fg: 15,
+            kind: ColorKind::Vga,
+        },
+        _ => return None,
+    })
+}
+
+/// IBM's 6-bit EGA register: primary bits are 0xAA and secondary bits are 0x55.
+/// Bit 0 blue, 1 green, 2 red, 3 secondary blue, 4 secondary green, 5 secondary red.
+fn ega64(index: u16) -> u32 {
+    let i = index & 63;
+    let level = |n: u16| match n {
+        0 => 0u32,
+        1 => 0x55,
+        2 => 0xAA,
+        _ => 0xFF,
+    };
+    let red = level(2 * ((i >> 2) & 1) + ((i >> 5) & 1));
+    let green = level(2 * ((i >> 1) & 1) + ((i >> 4) & 1));
+    let blue = level(2 * (i & 1) + ((i >> 3) & 1));
+    (red << 16) | (green << 8) | blue
+}
+
+fn vga256(index: usize) -> u32 {
+    if index < 16 {
+        return EGA16[index];
+    }
+    if index < 232 {
+        let cube = index - 16;
+        let red = (cube / 36) as u32;
+        let green = ((cube / 6) % 6) as u32;
+        let blue = (cube % 6) as u32;
+        return ((red * 51) << 16) | ((green * 51) << 8) | (blue * 51);
+    }
+    let grey = ((index - 232) as u32 * 255) / 23;
+    (grey << 16) | (grey << 8) | grey
+}
+
+fn cga_palette(standard: bool) -> Vec<u32> {
+    if standard {
+        vec![0x000000, 0x00AAAA, 0xAA00AA, 0xAAAAAA]
+    } else {
+        vec![0x000000, 0x00AA00, 0xAA0000, 0xAA5500]
+    }
+}
+
+struct WindowMap {
+    /// `WINDOW SCREEN` maps `(x0, y0)` to the top left.
+    screen: bool,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+}
+
+struct Gfx {
+    mode: u8,
+    kind: ColorKind,
+    pix_w: usize,
+    pix_h: usize,
+    pixels: Vec<u8>,
+    palette: Vec<u32>,
+    n_colors: usize,
+    fg: u8,
+    colorburst: u8,
+    view_l: i32,
+    view_t: i32,
+    view_r: i32,
+    view_b: i32,
+    /// `VIEW` without `SCREEN` puts `(0, 0)` at the top left of the viewport.
+    view_relative: bool,
+    window: Option<WindowMap>,
+    pen_x: f64,
+    pen_y: f64,
+}
+
+impl Gfx {
+    fn text() -> Self {
+        Self {
+            mode: 0,
+            kind: ColorKind::Text,
+            pix_w: 0,
+            pix_h: 0,
+            pixels: Vec::new(),
+            palette: Vec::new(),
+            n_colors: 0,
+            fg: 7,
+            colorburst: 0,
+            view_l: 0,
+            view_t: 0,
+            view_r: 0,
+            view_b: 0,
+            view_relative: false,
+            window: None,
+            pen_x: 0.0,
+            pen_y: 0.0,
+        }
+    }
+
+    fn reset_palette(&mut self) {
+        self.palette = match self.kind {
+            ColorKind::Text => Vec::new(),
+            ColorKind::Cga => cga_palette(self.colorburst == 0),
+            ColorKind::Mono2 => vec![EGA16[0], EGA16[15]],
+            ColorKind::Ega16 | ColorKind::Ega16Mod => EGA16.to_vec(),
+            ColorKind::Ega64 => EGA64_DEFAULT.iter().copied().map(ega64).collect(),
+            ColorKind::Mono4 => vec![0x000000, 0xAAAAAA, 0xFFFFFF, 0x555555],
+            ColorKind::Vga => (0..256).map(vga256).collect(),
+        };
+    }
+
+    fn colour_rgb(&self, index: u16) -> u32 {
+        match self.kind {
+            ColorKind::Ega64 => ega64(index),
+            ColorKind::Vga => vga256(usize::from(index)),
+            _ => EGA16[usize::from(index & 15)],
+        }
+    }
+
+    fn span(&self) -> (f64, f64) {
+        let w = f64::from(self.view_r - self.view_l + 1);
+        let h = f64::from(self.view_b - self.view_t + 1);
+        (w, h)
+    }
+
+    /// Local coordinates run from 0 at the viewport's top left to `size - 1`.
+    fn logical_to_local(&self, lx: f64, ly: f64) -> (f64, f64) {
+        let (vw, vh) = self.span();
+        let Some(window) = &self.window else {
+            return if self.view_relative {
+                (lx, ly)
+            } else {
+                (lx - f64::from(self.view_l), ly - f64::from(self.view_t))
+            };
+        };
+        let x = if vw <= 1.0 {
+            0.0
+        } else {
+            (lx - window.x0) / (window.x1 - window.x0) * (vw - 1.0)
+        };
+        let y = if vh <= 1.0 {
+            0.0
+        } else if window.screen {
+            (ly - window.y0) / (window.y1 - window.y0) * (vh - 1.0)
+        } else {
+            (ly - window.y1) / (window.y0 - window.y1) * (vh - 1.0)
+        };
+        (x, y)
+    }
+
+    fn local_to_logical(&self, lx: f64, ly: f64) -> (f64, f64) {
+        let (vw, vh) = self.span();
+        let Some(window) = &self.window else {
+            return if self.view_relative {
+                (lx, ly)
+            } else {
+                (f64::from(self.view_l) + lx, f64::from(self.view_t) + ly)
+            };
+        };
+        let x = if vw <= 1.0 {
+            window.x0
+        } else {
+            window.x0 + lx / (vw - 1.0) * (window.x1 - window.x0)
+        };
+        let y = if vh <= 1.0 {
+            window.y0
+        } else if window.screen {
+            window.y0 + ly / (vh - 1.0) * (window.y1 - window.y0)
+        } else {
+            window.y1 + ly / (vh - 1.0) * (window.y0 - window.y1)
+        };
+        (x, y)
+    }
+
+    fn logical_to_viewport(&self, lx: f64, ly: f64) -> (f64, f64) {
+        let (local_x, local_y) = self.logical_to_local(lx, ly);
+        if self.view_relative {
+            (local_x, local_y)
+        } else {
+            (
+                f64::from(self.view_l) + local_x,
+                f64::from(self.view_t) + local_y,
+            )
+        }
+    }
+
+    fn viewport_to_logical(&self, vx: f64, vy: f64) -> (f64, f64) {
+        let local_x = if self.view_relative {
+            vx
+        } else {
+            vx - f64::from(self.view_l)
+        };
+        let local_y = if self.view_relative {
+            vy
+        } else {
+            vy - f64::from(self.view_t)
+        };
+        self.local_to_logical(local_x, local_y)
+    }
+
+    fn to_physical(&self, lx: f64, ly: f64) -> Result<(i32, i32), GfxErr> {
+        let (local_x, local_y) = self.logical_to_local(lx, ly);
+        let px = f64::from(self.view_l) + local_x;
+        let py = f64::from(self.view_t) + local_y;
+        Ok((round_px(px)?, round_px(py)?))
+    }
+
+    fn reset_pen(&mut self) {
+        let (vw, vh) = self.span();
+        let (vx, vy) = if self.view_relative {
+            (vw / 2.0, vh / 2.0)
+        } else {
+            (
+                f64::from(self.view_l) + vw / 2.0,
+                f64::from(self.view_t) + vh / 2.0,
+            )
+        };
+        let (lx, ly) = self.viewport_to_logical(vx, vy);
+        self.pen_x = lx;
+        self.pen_y = ly;
+    }
+
+    fn in_view(&self, x: i32, y: i32) -> bool {
+        x >= self.view_l && x <= self.view_r && y >= self.view_t && y <= self.view_b
+    }
+
+    fn on_screen(&self, x: i32, y: i32) -> bool {
+        x >= 0 && y >= 0 && (x as usize) < self.pix_w && (y as usize) < self.pix_h
+    }
+
+    fn put(&mut self, x: i32, y: i32, attr: u8) {
+        if !self.on_screen(x, y) {
+            return;
+        }
+        let index = (y as usize) * self.pix_w + (x as usize);
+        self.pixels[index] = attr;
+    }
+
+    fn clamp_attr(&self, attrib: u8) -> u8 {
+        let last = self.palette.len().saturating_sub(1);
+        if usize::from(attrib) > last {
+            last as u8
+        } else {
+            attrib
+        }
+    }
+
+    fn map_axis(&self, coord: f64, vertical: bool, to_logical: bool) -> Result<f64, GfxErr> {
+        if to_logical && !in_i16(coord) {
+            return Err(GfxErr::Overflow);
+        }
+        let (x, y) = if to_logical {
+            if vertical {
+                self.viewport_to_logical(0.0, coord)
+            } else {
+                self.viewport_to_logical(coord, 0.0)
+            }
+        } else if vertical {
+            self.logical_to_viewport(0.0, coord)
+        } else {
+            self.logical_to_viewport(coord, 0.0)
+        };
+        let result = if vertical { y } else { x };
+        if !to_logical && !in_i16(result) {
+            return Err(GfxErr::Overflow);
+        }
+        if !result.is_finite() {
+            return Err(GfxErr::Overflow);
+        }
+        Ok(result)
+    }
+}
+
+fn in_i16(v: f64) -> bool {
+    v.is_finite() && (-32768.0..=32767.0).contains(&v)
+}
+
+fn round_px(v: f64) -> Result<i32, GfxErr> {
+    if !v.is_finite() {
+        return Err(GfxErr::Overflow);
+    }
+    let rounded = if v >= 0.0 {
+        (v + 0.5).floor()
+    } else {
+        (v - 0.5).ceil()
+    };
+    if !(-32768.0..=32767.0).contains(&rounded) {
+        return Err(GfxErr::Overflow);
+    }
+    Ok(rounded as i32)
+}
+
+fn byte_arg(n: i16) -> Result<u8, GfxErr> {
+    if (0..=255).contains(&n) {
+        Ok(n as u8)
+    } else {
+        Err(GfxErr::Illegal)
+    }
+}
+
+impl Screen {
+    pub fn graphics_mode(&self) -> u8 {
+        self.gfx.mode
+    }
+
+    pub fn pixel_size(&self) -> (usize, usize) {
+        (self.gfx.pix_w, self.gfx.pix_h)
+    }
+
+    pub fn pixel_rgb(&self, x: usize, y: usize) -> u32 {
+        if x >= self.gfx.pix_w || y >= self.gfx.pix_h {
+            return 0;
+        }
+        let attr = self.gfx.pixels[y * self.gfx.pix_w + x];
+        self.attribute_rgb(attr)
+    }
+
+    pub fn attribute_rgb(&self, attr: u8) -> u32 {
+        self.gfx
+            .palette
+            .get(usize::from(attr))
+            .copied()
+            .unwrap_or(EGA16[usize::from(attr & 0x0F)])
+    }
+
+    pub fn apply_screen(&mut self, args: ScreenArgs) -> Result<(), GfxErr> {
+        if args.erase {
+            return Err(GfxErr::Illegal);
+        }
+        let mode = if let Some(mode) = args.mode {
+            if !(0..=255).contains(&mode) {
+                return Err(GfxErr::Illegal);
+            }
+            let mode = mode as u8;
+            if mode != 0 && mode_spec(mode).is_none() {
+                return Err(GfxErr::Illegal);
+            }
+            mode
+        } else {
+            self.gfx.mode
+        };
+        let burst = if let Some(burst) = args.burst {
+            byte_arg(burst)?
+        } else {
+            self.gfx.colorburst
+        };
+        for page in [args.active, args.visible].into_iter().flatten() {
+            if page != 0 {
+                return Err(GfxErr::Illegal);
+            }
+        }
+        let changed = mode != self.gfx.mode;
+        let burst_flip = (burst == 0) != (self.gfx.colorburst == 0);
+        let clear = mode == 0 || changed || burst_flip;
+        self.enter(mode, burst, clear);
+        Ok(())
+    }
+
+    pub fn plot(
+        &mut self,
+        step: bool,
+        x: f64,
+        y: f64,
+        attrib: Option<u8>,
+        preset: bool,
+    ) -> Result<(), GfxErr> {
+        if self.gfx.mode == 0 {
+            return Err(GfxErr::Illegal);
+        }
+        if !in_i16(x) || !in_i16(y) {
+            return Err(GfxErr::Overflow);
+        }
+        let (lx, ly) = if step {
+            (self.gfx.pen_x + x, self.gfx.pen_y + y)
+        } else {
+            (x, y)
+        };
+        let (px, py) = self.gfx.to_physical(lx, ly)?;
+        self.gfx.pen_x = lx;
+        self.gfx.pen_y = ly;
+        let attr = match attrib {
+            Some(attr) => self.gfx.clamp_attr(attr),
+            None if preset => 0,
+            None => self.gfx.fg,
+        };
+        if self.gfx.in_view(px, py) {
+            self.gfx.put(px, py, attr);
+        }
+        Ok(())
+    }
+
+    pub fn point_fn(&self, func: i16) -> Result<f64, GfxErr> {
+        if !(0..=3).contains(&func) {
+            return Err(GfxErr::Illegal);
+        }
+        let (vx, vy) = self.gfx.logical_to_viewport(self.gfx.pen_x, self.gfx.pen_y);
+        let value = match func {
+            0 => vx,
+            1 => vy,
+            2 => self.gfx.pen_x,
+            _ => self.gfx.pen_y,
+        };
+        if !value.is_finite() {
+            return Err(GfxErr::Overflow);
+        }
+        Ok(value)
+    }
+
+    pub fn point_xy(&self, x: f64, y: f64) -> Result<i16, GfxErr> {
+        if !in_i16(x) || !in_i16(y) {
+            return Err(GfxErr::Overflow);
+        }
+        if self.gfx.mode == 0 {
+            return Err(GfxErr::Illegal);
+        }
+        let (px, py) = self.gfx.to_physical(x, y)?;
+        if !self.gfx.in_view(px, py) {
+            return Ok(-1);
+        }
+        Ok(i16::from(
+            self.gfx.pixels[(py as usize) * self.gfx.pix_w + (px as usize)],
+        ))
+    }
+
+    pub fn pmap(&self, coord: f64, func: i16) -> Result<f64, GfxErr> {
+        if !(0..=3).contains(&func) {
+            return Err(GfxErr::Illegal);
+        }
+        if self.gfx.mode == 0 {
+            return Ok(0.0);
+        }
+        if !coord.is_finite() {
+            return Err(GfxErr::Overflow);
+        }
+        self.gfx.map_axis(coord, func & 1 == 1, func >= 2)
+    }
+
+    pub fn reset_view(&mut self) -> Result<(), GfxErr> {
+        if self.gfx.mode == 0 {
+            return Err(GfxErr::Illegal);
+        }
+        self.gfx.view_l = 0;
+        self.gfx.view_t = 0;
+        self.gfx.view_r = self.gfx.pix_w as i32 - 1;
+        self.gfx.view_b = self.gfx.pix_h as i32 - 1;
+        self.gfx.view_relative = false;
+        self.gfx.reset_pen();
+        Ok(())
+    }
+
+    pub fn set_view(
+        &mut self,
+        screen_coords: bool,
+        corners: [f64; 4],
+        fill: Option<u8>,
+        border: Option<u8>,
+    ) -> Result<(), GfxErr> {
+        if self.gfx.mode == 0 {
+            return Err(GfxErr::Illegal);
+        }
+        let x0 = round_px(corners[0])?;
+        let y0 = round_px(corners[1])?;
+        let x1 = round_px(corners[2])?;
+        let y1 = round_px(corners[3])?;
+        if !self.gfx.on_screen(x0, y0) || !self.gfx.on_screen(x1, y1) {
+            return Err(GfxErr::Illegal);
+        }
+        self.gfx.view_l = x0.min(x1);
+        self.gfx.view_r = x0.max(x1);
+        self.gfx.view_t = y0.min(y1);
+        self.gfx.view_b = y0.max(y1);
+        self.gfx.view_relative = !screen_coords;
+        if let Some(fill) = fill {
+            let attr = self.gfx.clamp_attr(fill);
+            let (left, top, right, bottom) = (
+                self.gfx.view_l,
+                self.gfx.view_t,
+                self.gfx.view_r,
+                self.gfx.view_b,
+            );
+            for y in top..=bottom {
+                for x in left..=right {
+                    self.gfx.put(x, y, attr);
+                }
+            }
+        }
+        if let Some(border) = border {
+            let attr = self.gfx.clamp_attr(border);
+            let (left, top, right, bottom) = (
+                self.gfx.view_l,
+                self.gfx.view_t,
+                self.gfx.view_r,
+                self.gfx.view_b,
+            );
+            for x in (left - 1)..=(right + 1) {
+                self.gfx.put(x, top - 1, attr);
+                self.gfx.put(x, bottom + 1, attr);
+            }
+            for y in top..=bottom {
+                self.gfx.put(left - 1, y, attr);
+                self.gfx.put(right + 1, y, attr);
+            }
+        }
+        self.gfx.reset_pen();
+        Ok(())
+    }
+
+    pub fn set_window(
+        &mut self,
+        screen_style: bool,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+    ) -> Result<(), GfxErr> {
+        if self.gfx.mode == 0 {
+            return Err(GfxErr::Illegal);
+        }
+        if !x0.is_finite() || !y0.is_finite() || !x1.is_finite() || !y1.is_finite() {
+            return Err(GfxErr::Overflow);
+        }
+        if x0 == x1 || y0 == y1 {
+            return Err(GfxErr::Illegal);
+        }
+        self.gfx.window = Some(WindowMap {
+            screen: screen_style,
+            x0,
+            y0,
+            x1,
+            y1,
+        });
+        self.gfx.reset_pen();
+        Ok(())
+    }
+
+    pub fn clear_window(&mut self) -> Result<(), GfxErr> {
+        if self.gfx.mode == 0 {
+            return Err(GfxErr::Illegal);
+        }
+        self.gfx.window = None;
+        self.gfx.reset_pen();
+        Ok(())
+    }
+
+    pub fn set_palette(&mut self, assignment: Option<(i16, i16)>) -> Result<(), GfxErr> {
+        if self.gfx.mode == 0 {
+            return Err(GfxErr::Illegal);
+        }
+        let Some((attrib, colour)) = assignment else {
+            self.gfx.reset_palette();
+            return Ok(());
+        };
+        if attrib < 0 || attrib as usize >= self.gfx.palette.len() {
+            return Err(GfxErr::Illegal);
+        }
+        if colour < -1 || (colour >= 0 && colour as usize >= self.gfx.n_colors) {
+            return Err(GfxErr::Illegal);
+        }
+        if colour >= 0 {
+            self.gfx.palette[attrib as usize] = self.gfx.colour_rgb(colour as u16);
+        }
+        Ok(())
+    }
+
+    pub fn color_graphics(&mut self, args: ColorArgs) -> Result<(), GfxErr> {
+        if self.gfx.mode == 0 || self.gfx.kind == ColorKind::Mono2 {
+            return Err(GfxErr::Illegal);
+        }
+        match self.gfx.kind {
+            ColorKind::Cga => self.color_cga(args),
+            ColorKind::Ega16Mod => self.color_foreground(args, 1, 15, 15, true),
+            ColorKind::Ega16 => self.color_foreground(args, 1, 15, 15, false),
+            ColorKind::Ega64 => self.color_foreground(args, 1, 15, 15, false),
+            ColorKind::Mono4 => self.color_foreground(args, 1, 3, 15, false),
+            ColorKind::Vga => self.color_foreground(args, 1, 255, 255, false),
+            ColorKind::Text | ColorKind::Mono2 => Err(GfxErr::Illegal),
+        }
+    }
+
+    pub fn screen_cell(&self, row: i16, col: i16, func: i16) -> Result<i16, GfxErr> {
+        if !(1..=25).contains(&row) {
+            return Err(GfxErr::Illegal);
+        }
+        if self.keys_on && row == 25 {
+            return Err(GfxErr::Illegal);
+        }
+        if col < 1 || col > self.width as i16 {
+            return Err(GfxErr::Illegal);
+        }
+        if func != 0 && self.gfx.mode != 0 {
+            return Ok(0);
+        }
+        let cell = self.cell((row as usize) - 1, (col as usize) - 1);
+        if func == 0 {
+            Ok(i16::from(cell.ch))
+        } else {
+            Ok(i16::from(cell.attr))
+        }
+    }
+
+    fn enter(&mut self, mode: u8, burst: u8, clear: bool) {
+        if mode == 0 {
+            self.gfx.mode = 0;
+            self.gfx.kind = ColorKind::Text;
+            self.gfx.colorburst = burst;
+            self.gfx.pixels.clear();
+            self.gfx.palette.clear();
+            self.gfx.pix_w = 0;
+            self.gfx.pix_h = 0;
+            self.gfx.n_colors = 0;
+            self.attr = ATTR_NORMAL;
+            if clear {
+                self.clear_text();
+            }
+            return;
+        }
+        let Some(spec) = mode_spec(mode) else {
+            return;
+        };
+        self.gfx.colorburst = burst;
+        if !clear {
+            return;
+        }
+        self.gfx.mode = mode;
+        self.gfx.kind = spec.kind;
+        self.gfx.n_colors = spec.colors;
+        self.gfx.fg = spec.fg;
+        self.gfx.pix_w = spec.w;
+        self.gfx.pix_h = spec.h;
+        self.gfx.pixels = vec![0; spec.w * spec.h];
+        self.gfx.view_l = 0;
+        self.gfx.view_t = 0;
+        self.gfx.view_r = spec.w as i32 - 1;
+        self.gfx.view_b = spec.h as i32 - 1;
+        self.gfx.view_relative = false;
+        self.gfx.window = None;
+        self.gfx.reset_palette();
+        self.gfx.reset_pen();
+        self.attr = spec.fg;
+        self.width = spec.cols;
+        self.rows = (0..SCREEN_ROWS).map(|_| self.blank_row()).collect();
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+    }
+
+    fn color_cga(&mut self, args: ColorArgs) -> Result<(), GfxErr> {
+        let background = args.foreground.map(byte_arg).transpose()?;
+        let palette = args.palette_0.map(byte_arg).transpose()?;
+        let over = args.extra.map(byte_arg).transpose()?;
+        if let Some(background) = background {
+            self.gfx.palette[0] = ega64(u16::from(background) % 64);
+        }
+        if let Some(choice) = over.or(palette) {
+            let colors = cga_palette(choice % 2 == 1);
+            self.gfx.palette[1] = colors[1];
+            self.gfx.palette[2] = colors[2];
+            self.gfx.palette[3] = colors[3];
+        }
+        Ok(())
+    }
+
+    fn color_foreground(
+        &mut self,
+        args: ColorArgs,
+        fg_min: i16,
+        fg_max: i16,
+        palette_max: i16,
+        modulo8: bool,
+    ) -> Result<(), GfxErr> {
+        if let Some(fg) = args.foreground {
+            if fg < fg_min || fg > fg_max {
+                return Err(GfxErr::Illegal);
+            }
+        }
+        if let Some(background) = args.palette_0 {
+            if background < 0 || background > palette_max {
+                return Err(GfxErr::Illegal);
+            }
+        }
+        if let Some(extra) = args.extra {
+            byte_arg(extra)?;
+        }
+        if let Some(fg) = args.foreground {
+            self.gfx.fg = fg as u8;
+            self.attr = fg as u8;
+        }
+        if let Some(background) = args.palette_0 {
+            let index = if modulo8 { background % 8 } else { background };
+            self.gfx.palette[0] = self.gfx.colour_rgb(index as u16);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -791,5 +1659,34 @@ mod tests {
         let text = screen.take_logical_line();
         assert_eq!(text.len(), 80);
         assert_eq!(screen.cursor(), (1, 0));
+    }
+
+    #[test]
+    fn ega64_defaults_match_the_ega16_colours() {
+        for (index, rgb) in EGA64_DEFAULT.iter().zip(EGA16) {
+            assert_eq!(ega64(*index), rgb);
+        }
+        assert_eq!(ega64(20), 0x00AA_5500);
+        assert_eq!(ega64(63), 0x00FF_FFFF);
+    }
+
+    #[test]
+    fn window_pmap_flips_the_y_axis() {
+        let mut screen = Screen::new(80);
+        screen
+            .apply_screen(ScreenArgs {
+                mode: Some(1),
+                burst: Some(0),
+                active: None,
+                visible: None,
+                erase: false,
+            })
+            .unwrap();
+        screen.set_window(false, 0.0, 0.0, 319.0, 199.0).unwrap();
+        assert_eq!(screen.pmap(0.0, 1).unwrap(), 199.0);
+        assert_eq!(screen.pmap(199.0, 1).unwrap(), 0.0);
+        screen.set_window(true, 0.0, 0.0, 319.0, 199.0).unwrap();
+        assert_eq!(screen.pmap(0.0, 1).unwrap(), 0.0);
+        assert_eq!(screen.pmap(199.0, 1).unwrap(), 199.0);
     }
 }

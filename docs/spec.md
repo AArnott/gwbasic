@@ -15,17 +15,17 @@ This is an original summary of the behavior the emulator follows. It is not a re
 
 ## What runs today
 
-The editor and the text-mode interpreter:
+The editor and the interpreter:
 
 - An 80×25 (or 40×25) text window, not the host terminal. Cells are 8×16. The default window is 1280×800, which is the 640×400 grid at scale 2, letterboxed if the window is another size.
 - Startup banner, `Ok`, and the row-25 soft-key strip.
 - Logical lines, the editing keys below, and F1–F10.
-- Direct commands: `NEW`, `LIST`, `EDIT`, `DELETE`, `AUTO`, `SYSTEM`, `KEY`, `KEY ON`, `KEY OFF`, `KEY LIST`, `RUN`, `CONT`, `TRON`, `TROFF`, `SCREEN 0`, `WIDTH 40|80`, `CLS`, `REM`, and a leading `'`.
+- Direct commands: `NEW`, `LIST`, `EDIT`, `DELETE`, `AUTO`, `SYSTEM`, `KEY`, `KEY ON`, `KEY OFF`, `KEY LIST`, `RUN`, `CONT`, `TRON`, `TROFF`, `WIDTH 40|80`, `CLS`, `REM`, and a leading `'`. `SCREEN` is an ordinary statement.
 - Numbered lines tokenized on Enter. `LIST` prints the detokenized source, so an edit after `LIST` round-trips. `?` is stored and listed as `PRINT`.
 - `RUN` executes from the first line, or from a line number. An empty program still prints `Ok`. A filename on the command line loads and does not run.
 - `PRINT`, `LPRINT`, `PRINT USING` (the common field forms), and `?`. Numbers are Microsoft Binary Format. A positive number prints with a leading space, and every number prints with a trailing space. A trailing `;` or `,` holds the cursor, so `PRINT "Hello";` is followed by `Ok` on the same line.
 - `LET` (optional), `GOTO`, `GOSUB`/`RETURN`, `IF`/`THEN`/`ELSE`, `FOR`/`NEXT`, `WHILE`/`WEND`, `ON n GOTO`/`GOSUB`, `END`, `STOP`, `CONT`, `TRON`/`TROFF`, and `REM`.
-- `CLS`, `LOCATE`, `COLOR`, `WIDTH`, and `BEEP`. Text `COLOR` and `LOCATE` only; there is no graphics screen.
+- `CLS`, `LOCATE`, `COLOR`, `WIDTH`, and `BEEP`, plus the graphics statements in the Graphics section. Text `COLOR` and `LOCATE` remain.
 - `INTEGER`, `SINGLE`, `DOUBLE`, and `STRING`, plus `DEFINT`/`DEFSNG`/`DEFDBL`/`DEFSTR`, `DEF FN`, arrays, and `OPTION BASE`. `FNA` is the function `FN A`.
 - `INPUT`, `LINE INPUT`, and `INKEY$`. `DATA`/`READ`/`RESTORE`.
 - A program line that fails to tokenize is not stored. The screen shows `^`, then `Syntax error` or `Overflow`, then `Ok`.
@@ -46,7 +46,7 @@ The editor and the text-mode interpreter:
 - `COMMON name` and `COMMON name()` name the scalars and arrays that the next `CHAIN` keeps when `ALL` is absent. A scalar and an array of the same name are separate. The names are recorded when `COMMON` runs.
 - `INPUT$(n)` and `INPUT$(n,#file)` read `n` characters, with `n` from 1 to 255. From a file, those characters are raw bytes, including CR and LF. If fewer bytes remain, the result is `Input past end` and the file position stays put. From the keyboard, `INPUT$` does not echo. It waits until that many keys are waiting, then the statement runs again. Ctrl+Break and Ctrl+C during the wait stop the program the way they do at `INPUT`.
 
-Still `Illegal function call` at run time, after they tokenize: graphics (`SCREEN` other than 0, `PSET`, `PRESET`, `LINE`, `CIRCLE`, `PAINT`, `DRAW`), `PLAY`, random files (`FIELD`, `GET`, `PUT`), `CALL`/`USR`, and device statements such as `OUT` and `WAIT`. Serial, cassette, joystick, and light pen stay out.
+Still `Illegal function call` at run time, after they tokenize: `CIRCLE`, `PAINT`, `DRAW`, `PLAY`, random files (`FIELD`, `GET`, `PUT`), `CALL`/`USR`, and device statements such as `OUT` and `WAIT`. A graphics `LINE` is a syntax error (`LINE INPUT` reads a line). `PALETTE USING`, `VIEW PRINT`, and `PCOPY` are not implemented. Serial, cassette, joystick, and light pen stay out.
 
 The window is winit and softbuffer, so the editor is the same program on Windows, Linux, and macOS. The tone uses `kernel32` `Beep` on Windows, `osascript beep` on macOS, and `paplay` of the freedesktop bell on Linux. A missing player is ignored. The unit tests never open a window and never play a tone.
 
@@ -90,9 +90,39 @@ There is no separate line buffer. The cells under the cursor are the line being 
 
 Row 25 (index 24) is the soft-key strip while `KEY ON` (the default). It is not a place you type. Down and Right stop on row 24. `KEY OFF` makes all 25 rows editable and hides the strip. `KEY ON` shows it again.
 
-`CLS`, `SCREEN 0`, and `WIDTH` clear the editable rows and home the cursor. `WIDTH 40` or `WIDTH 80` also rebuilds the grid. Any other width, and any `SCREEN` mode other than 0, is `Illegal function call`. `SCREEN 0` accepts the extra numeric arguments F10 sends (`SCREEN 0,0,0`).
+`CLS` and text-mode `WIDTH` clear the editable rows and home the cursor. `WIDTH 40` or `WIDTH 80` also rebuilds the grid. Any other width is `Illegal function call`. `SCREEN` is an ordinary statement. F10 types `SCREEN 0,0,0`, which clears. Graphics `WIDTH` is described below.
 
 Ctrl+Home clears the screen and homes the cursor. The program store is unchanged. Home moves to the top left and does not clear.
+
+## Graphics
+
+`SCREEN [mode][,[colorburst][,[apage][,[vpage]]]]]`. At least one argument is required; none is `Missing operand`. Modes 0, 1, 2, and 7 through 13 work. Modes 3, 4, 5, and 6 are `Illegal function call`. Only page 0 exists, so a non-zero active or visual page is `Illegal function call` and changes nothing. A fifth argument is type-checked and then rejected the same way. A string is `Type mismatch`. A value that is not an integer in range is `Overflow`.
+
+Mode 0 is text and keeps the current 40 or 80 columns. It always clears the text, including `SCREEN 0,0,0` when the mode and burst were already 0, and it drops the pixel buffer. The pen, `VIEW`, and `WINDOW` stay, so `POINT(0)` through `POINT(3)` still report that pen. `PMAP` in text mode returns 0.
+
+| Mode | Pixels | Columns | Attributes |
+| --- | --- | --- | --- |
+| 1 | 320×200 | 40 | 4 |
+| 2 | 640×200 | 80 | 2 |
+| 7 | 320×200 | 40 | 16 |
+| 8 | 640×200 | 80 | 16 |
+| 9 | 640×350 | 80 | 16 of 64 |
+| 10 | 640×350 | 80 | 4 |
+| 11 | 640×480 | 80 | 2 |
+| 12 | 640×480 | 80 | 16 |
+| 13 | 320×200 | 40 | 256 |
+
+Entering a graphics mode, or flipping color burst between zero and non-zero, clears the pixels and the text, resets `VIEW` to the whole screen, clears `WINDOW`, and parks the pen at the center. The same graphics mode with the same zero or non-zero burst does not clear. On `SCREEN 1`, burst 0 is cyan, magenta, and white. Any other burst is green, red, and brown. `WIDTH 80` from mode 1 selects mode 2, and `WIDTH 40` selects mode 1. Modes 7 and 8 pair the same way. `WIDTH 40` from mode 9 selects mode 7. A width the mode cannot use is `Illegal function call` and changes nothing. `RUN` and `NEW` leave the mode alone.
+
+`PSET [STEP] (x,y)[,color]` and `PRESET` plot one pixel. The default color is the foreground, or 0 for `PRESET`. A color past the last attribute is drawn as that last attribute. A color outside 0 to 255 is `Illegal function call`. Coordinates are logical and have to fall in −32768 to 32767, or the result is `Overflow`. `POINT(x,y)` checks that range before it rejects text mode. Outside the viewport, the pen still moves and nothing is drawn. `STEP` offsets from the pen. `POINT(x,y)` returns the attribute, or −1 outside the viewport, and does not move the pen. In text mode that form is `Illegal function call`. `POINT(0)` and `POINT(1)` are the viewport pen. `POINT(2)` and `POINT(3)` are the logical pen. `PMAP(coord,fn)` converts one axis: 0 and 1 go from logical to viewport, and 2 and 3 go the other way.
+
+`VIEW [[SCREEN] (x1,y1)-(x2,y2)[,[fill][,border]]]` clips plotting to that rectangle. The corners are physical pixels and both have to lie on the screen. Without `SCREEN`, `(0,0)` is the viewport's top left. `VIEW` alone restores the full screen and does not clear `WINDOW`. `WINDOW [[SCREEN] (x1,y1)-(x2,y2)]` maps logical coordinates onto the viewport. Without `SCREEN`, y increases upward. The two x values, and the two y values, have to differ. `WINDOW` alone clears that mapping and does not clear `VIEW`. Both statements are `Illegal function call` in text mode. `VIEW PRINT` is a syntax error, so the line is not stored.
+
+`COLOR` in text mode is still a foreground and a background, each 0 to 15. In a graphics mode other than 1, 2, and 11, it sets the foreground. `SCREEN 1` sets the background and the CGA palette and leaves the foreground at 3. `SCREEN 2` and `SCREEN 11` reject `COLOR`. `PALETTE attribute,color` recolors one attribute, and existing pixels change with it. Color −1 leaves that entry alone. `PALETTE` alone restores the mode's palette. `PALETTE USING` is a syntax error.
+
+`CIRCLE`, `PAINT`, and `DRAW` tokenize and raise `Illegal function call`. A graphics `LINE` is a syntax error. `LINE INPUT` is unchanged.
+
+The window scales the pixel buffer into the letterbox, then draws the text glyphs over it. Spaces are left transparent. `POINT` reads the pixel buffer, not the glyphs. The unit tests do not open a window.
 
 ## Editing keys
 

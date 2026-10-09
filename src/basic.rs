@@ -210,6 +210,9 @@ enum Func {
     Cvd,
     Environ,
     InputFn,
+    Point,
+    Pmap,
+    ScreenFn,
     /// A tokenized function this milestone does not implement (`VARPTR`, `INP`, …).
     Unsupported,
 }
@@ -1214,8 +1217,14 @@ fn walk(
                 Ok(Flow::Next)
             }
         }
-        "CALL" | "OUT" | "WAIT" | "PLAY" | "DRAW" | "PSET" | "PRESET" | "CIRCLE" | "PAINT"
-        | "SCREEN" | "KEY" | "EDIT" | "DELETE" | "AUTO" | "FIELD" | "GET" | "PUT" => {
+        "PSET" => exec_pset(parser, mode, ctx.as_mut(), false),
+        "PRESET" => exec_pset(parser, mode, ctx.as_mut(), true),
+        "SCREEN" => exec_screen(parser, mode, ctx.as_mut()),
+        "VIEW" => exec_view(parser, mode, ctx.as_mut()),
+        "WINDOW" => exec_window(parser, mode, ctx.as_mut()),
+        "PALETTE" => exec_palette(parser, mode, ctx.as_mut()),
+        "CALL" | "OUT" | "WAIT" | "PLAY" | "DRAW" | "CIRCLE" | "PAINT" | "KEY" | "EDIT"
+        | "DELETE" | "AUTO" | "FIELD" | "GET" | "PUT" => {
             // Recognized, not part of this milestone. Skip the rest of the statement.
             parser.bump();
             skip_statement(parser);
@@ -1593,6 +1602,9 @@ fn func_of(name: &str) -> Option<Func> {
         "CVI" => Func::Cvi,
         "CVS" => Func::Cvs,
         "CVD" => Func::Cvd,
+        "POINT" => Func::Point,
+        "PMAP" => Func::Pmap,
+        "SCREEN" => Func::ScreenFn,
         _ => return None,
     })
 }
@@ -1611,8 +1623,9 @@ fn naked_of(name: &str) -> Option<Naked> {
 
 fn arity(func: Func) -> (usize, usize) {
     match func {
-        Func::Left | Func::Right | Func::StringFn => (2, 2),
-        Func::Mid | Func::Instr => (2, 3),
+        Func::Left | Func::Right | Func::StringFn | Func::Pmap => (2, 2),
+        Func::Mid | Func::Instr | Func::ScreenFn => (2, 3),
+        Func::Point => (1, 2),
         Func::Rnd => (0, 1),
         Func::Unsupported => (0, 16),
         _ => (1, 1),
@@ -2344,6 +2357,9 @@ fn eval_call(vm: &mut Vm, host: &mut Host<'_>, func: Func, args: &[Expr]) -> Res
             Ok(Value::Str(value))
         }
         Func::InputFn => eval_input_fn(vm, host, &values),
+        Func::Point => eval_point(host, &values),
+        Func::Pmap => eval_pmap(host, &values),
+        Func::ScreenFn => eval_screen_fn(host, &values),
         Func::Unsupported => Err(fault(ILLEGAL, 5)),
     }
 }
@@ -3366,7 +3382,9 @@ fn exec_width(
     if n != 40 && n != 80 {
         return Err(fault(ILLEGAL, 5));
     }
-    ctx.1.screen.set_width(n as usize);
+    if !ctx.1.screen.set_width(n as usize) {
+        return Err(fault(ILLEGAL, 5));
+    }
     *ctx.1.key_offset = 0;
     Ok(Flow::Next)
 }
@@ -3451,6 +3469,21 @@ fn exec_color(
         return Ok(Flow::Next);
     }
     let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    if ctx.1.screen.graphics_mode() != 0 {
+        let foreground = optional_cint(ctx.0, ctx.1, slot_expr(&slots, 0))?;
+        let palette_0 = optional_cint(ctx.0, ctx.1, slot_expr(&slots, 1))?;
+        let extra = optional_cint(ctx.0, ctx.1, slot_expr(&slots, 2))?;
+        return ctx
+            .1
+            .screen
+            .color_graphics(crate::screen::ColorArgs {
+                foreground,
+                palette_0,
+                extra,
+            })
+            .map_err(gfx_fault)
+            .map(|()| Flow::Next);
+    }
     let attr = ctx.1.screen.attr();
     let fg = slot_int(
         ctx.0,
@@ -3468,6 +3501,340 @@ fn exec_color(
         return Err(fault(ILLEGAL, 5));
     }
     ctx.1.screen.set_attr(((bg as u8) << 4) | (fg as u8));
+    Ok(Flow::Next)
+}
+
+fn gfx_fault(err: crate::screen::GfxErr) -> RunErr {
+    match err {
+        crate::screen::GfxErr::Illegal => fault(ILLEGAL, 5),
+        crate::screen::GfxErr::Overflow => fault(OVERFLOW, 6),
+    }
+}
+
+fn coord_of(value: &Value) -> Result<f64, RunErr> {
+    match value {
+        Value::Str(_) => Err(fault(TYPE_MISMATCH, 13)),
+        Value::Int(n) => Ok(f64::from(*n)),
+        Value::Single(m) | Value::Double(m) => {
+            let n = m.to_f64();
+            if n.is_finite() {
+                Ok(n)
+            } else {
+                Err(fault(OVERFLOW, 6))
+            }
+        }
+    }
+}
+
+fn value_from_coord(value: f64) -> Result<Value, RunErr> {
+    if !value.is_finite() {
+        return Err(fault(OVERFLOW, 6));
+    }
+    let nearest = value.round();
+    if (value - nearest).abs() < 1e-6 && (-32768.0..=32767.0).contains(&nearest) {
+        return Ok(Value::Int(nearest as i16));
+    }
+    match Mbf::from_f64(value, false) {
+        Ok(m) => Ok(Value::Single(m)),
+        Err(_) => Err(fault(OVERFLOW, 6)),
+    }
+}
+
+fn slot_expr(slots: &[Option<Expr>], index: usize) -> Option<&Expr> {
+    slots.get(index).and_then(|slot| slot.as_ref())
+}
+
+fn optional_cint(
+    vm: &mut Vm,
+    host: &mut Host<'_>,
+    slot: Option<&Expr>,
+) -> Result<Option<i16>, RunErr> {
+    match slot {
+        None => Ok(None),
+        Some(expr) => Ok(Some(cint_value(&eval_expr(vm, host, expr)?)?)),
+    }
+}
+
+fn eval_attr(vm: &mut Vm, host: &mut Host<'_>, expr: &Expr) -> Result<u8, RunErr> {
+    let n = cint_value(&eval_expr(vm, host, expr)?)?;
+    if !(0..=255).contains(&n) {
+        return Err(fault(ILLEGAL, 5));
+    }
+    Ok(n as u8)
+}
+
+fn eval_point(host: &mut Host<'_>, values: &[Value]) -> Result<Value, RunErr> {
+    if values.len() == 1 {
+        let func = cint_value(&values[0])?;
+        let coord = host.screen.point_fn(func).map_err(gfx_fault)?;
+        return value_from_coord(coord);
+    }
+    let x = coord_of(&values[0])?;
+    let y = coord_of(&values[1])?;
+    Ok(Value::Int(host.screen.point_xy(x, y).map_err(gfx_fault)?))
+}
+
+fn eval_pmap(host: &mut Host<'_>, values: &[Value]) -> Result<Value, RunErr> {
+    let coord = coord_of(&values[0])?;
+    let func = cint_value(&values[1])?;
+    let mapped = host.screen.pmap(coord, func).map_err(gfx_fault)?;
+    value_from_coord(mapped)
+}
+
+fn eval_screen_fn(host: &mut Host<'_>, values: &[Value]) -> Result<Value, RunErr> {
+    let row = cint_value(&values[0])?;
+    let col = cint_value(&values[1])?;
+    let func = if values.len() == 3 {
+        let n = cint_value(&values[2])?;
+        if !(0..=255).contains(&n) {
+            return Err(fault(ILLEGAL, 5));
+        }
+        n
+    } else {
+        0
+    };
+    Ok(Value::Int(
+        host.screen.screen_cell(row, col, func).map_err(gfx_fault)?,
+    ))
+}
+
+struct Corners {
+    x0: Expr,
+    y0: Expr,
+    x1: Expr,
+    y1: Expr,
+}
+
+fn parse_corners(parser: &mut Parser<'_>) -> Result<Corners, RunErr> {
+    expect_punct(parser, b'(')?;
+    let x0 = parse_expr(parser)?;
+    expect_punct(parser, b',')?;
+    let y0 = parse_expr(parser)?;
+    expect_punct(parser, b')')?;
+    if !is_dash(&parser.cur) {
+        return Err(fault(SYNTAX, 2));
+    }
+    parser.bump();
+    expect_punct(parser, b'(')?;
+    let x1 = parse_expr(parser)?;
+    expect_punct(parser, b',')?;
+    let y1 = parse_expr(parser)?;
+    expect_punct(parser, b')')?;
+    Ok(Corners { x0, y0, x1, y1 })
+}
+
+fn eval_corners(
+    vm: &mut Vm,
+    host: &mut Host<'_>,
+    corners: &Corners,
+) -> Result<(f64, f64, f64, f64), RunErr> {
+    let x0 = coord_of(&eval_expr(vm, host, &corners.x0)?)?;
+    let y0 = coord_of(&eval_expr(vm, host, &corners.y0)?)?;
+    let x1 = coord_of(&eval_expr(vm, host, &corners.x1)?)?;
+    let y1 = coord_of(&eval_expr(vm, host, &corners.y1)?)?;
+    Ok((x0, y0, x1, y1))
+}
+
+fn exec_pset(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+    preset: bool,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let step = if parser.cur.is("STEP") {
+        parser.bump();
+        true
+    } else {
+        false
+    };
+    expect_punct(parser, b'(')?;
+    let x = parse_expr(parser)?;
+    expect_punct(parser, b',')?;
+    let y = parse_expr(parser)?;
+    expect_punct(parser, b')')?;
+    let attrib = if matches!(parser.cur, Tok::Punct(b',')) {
+        parser.bump();
+        Some(parse_expr(parser)?)
+    } else {
+        None
+    };
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let x = coord_of(&eval_expr(ctx.0, ctx.1, &x)?)?;
+    let y = coord_of(&eval_expr(ctx.0, ctx.1, &y)?)?;
+    let attrib = match attrib {
+        None => None,
+        Some(expr) => Some(eval_attr(ctx.0, ctx.1, &expr)?),
+    };
+    ctx.1
+        .screen
+        .plot(step, x, y, attrib, preset)
+        .map_err(gfx_fault)?;
+    Ok(Flow::Next)
+}
+
+fn exec_screen(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    if terminated(&parser.cur) {
+        return Err(fault(MISSING, 22));
+    }
+    let slots = parse_slots(parser, 5)?;
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let mode_n = optional_cint(ctx.0, ctx.1, slot_expr(&slots, 0))?;
+    let burst = optional_cint(ctx.0, ctx.1, slot_expr(&slots, 1))?;
+    let active = optional_cint(ctx.0, ctx.1, slot_expr(&slots, 2))?;
+    let visible = optional_cint(ctx.0, ctx.1, slot_expr(&slots, 3))?;
+    if let Some(expr) = slot_expr(&slots, 4) {
+        let _ = cint_value(&eval_expr(ctx.0, ctx.1, expr)?)?;
+    }
+    let old_width = ctx.1.screen.width();
+    ctx.1
+        .screen
+        .apply_screen(crate::screen::ScreenArgs {
+            mode: mode_n,
+            burst,
+            active,
+            visible,
+            erase: slots.len() >= 5,
+        })
+        .map_err(gfx_fault)?;
+    if ctx.1.screen.width() != old_width {
+        *ctx.1.key_offset = 0;
+    }
+    Ok(Flow::Next)
+}
+
+fn exec_view(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    if parser.cur.is("PRINT") {
+        return Err(fault(SYNTAX, 2));
+    }
+    if terminated(&parser.cur) {
+        if mode == Mode::Check {
+            return Ok(Flow::Next);
+        }
+        let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+        ctx.1.screen.reset_view().map_err(gfx_fault)?;
+        return Ok(Flow::Next);
+    }
+    let screen_coords = if parser.cur.is("SCREEN") {
+        parser.bump();
+        true
+    } else {
+        false
+    };
+    let corners = parse_corners(parser)?;
+    let mut fill = None;
+    let mut border = None;
+    if matches!(parser.cur, Tok::Punct(b',')) {
+        parser.bump();
+        if !terminated(&parser.cur) && !matches!(parser.cur, Tok::Punct(b',')) {
+            fill = Some(parse_expr(parser)?);
+        }
+        if matches!(parser.cur, Tok::Punct(b',')) {
+            parser.bump();
+            if !terminated(&parser.cur) {
+                border = Some(parse_expr(parser)?);
+            }
+        }
+    }
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let (x0, y0, x1, y1) = eval_corners(ctx.0, ctx.1, &corners)?;
+    let fill = match fill {
+        None => None,
+        Some(expr) => Some(eval_attr(ctx.0, ctx.1, &expr)?),
+    };
+    let border = match border {
+        None => None,
+        Some(expr) => Some(eval_attr(ctx.0, ctx.1, &expr)?),
+    };
+    ctx.1
+        .screen
+        .set_view(screen_coords, [x0, y0, x1, y1], fill, border)
+        .map_err(gfx_fault)?;
+    Ok(Flow::Next)
+}
+
+fn exec_window(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    if terminated(&parser.cur) {
+        if mode == Mode::Check {
+            return Ok(Flow::Next);
+        }
+        let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+        ctx.1.screen.clear_window().map_err(gfx_fault)?;
+        return Ok(Flow::Next);
+    }
+    let screen_style = if parser.cur.is("SCREEN") {
+        parser.bump();
+        true
+    } else {
+        false
+    };
+    let corners = parse_corners(parser)?;
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let (x0, y0, x1, y1) = eval_corners(ctx.0, ctx.1, &corners)?;
+    ctx.1
+        .screen
+        .set_window(screen_style, x0, y0, x1, y1)
+        .map_err(gfx_fault)?;
+    Ok(Flow::Next)
+}
+
+fn exec_palette(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    if parser.cur.is("USING") {
+        return Err(fault(SYNTAX, 2));
+    }
+    if terminated(&parser.cur) {
+        if mode == Mode::Check {
+            return Ok(Flow::Next);
+        }
+        let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+        ctx.1.screen.set_palette(None).map_err(gfx_fault)?;
+        return Ok(Flow::Next);
+    }
+    let attrib = parse_expr(parser)?;
+    expect_punct(parser, b',')?;
+    let colour = parse_expr(parser)?;
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let attrib = cint_value(&eval_expr(ctx.0, ctx.1, &attrib)?)?;
+    let colour = cint_value(&eval_expr(ctx.0, ctx.1, &colour)?)?;
+    ctx.1
+        .screen
+        .set_palette(Some((attrib, colour)))
+        .map_err(gfx_fault)?;
     Ok(Flow::Next)
 }
 

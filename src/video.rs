@@ -1,11 +1,13 @@
-//! Text-mode window. 80×25 is 640×400 and 40×25 is 320×400, drawn with an
-//! integer scale and a black letterbox. Row 25 is the soft-key strip when
-//! KEY is on. The cursor is an inverted cell, or the lower half of one in
-//! insert mode; it is not stored in the cell buffer.
+//! The GW-BASIC window. Text mode is 80×25 (640×400) or 40×25 (320×400).
+//! A graphics mode blits its pixel buffer, then draws the text cells on top.
+//! Both use an integer scale and a black letterbox. Row 25 is the soft-key
+//! strip when KEY is on. The cursor is an inverted cell, or the lower half
+//! of one in insert mode; it is not stored in the cell buffer.
 
 use crate::font;
 use crate::input::{char_to_byte, ctrl_letter, Input};
 use crate::options::parse_args;
+use crate::screen::EGA16;
 use crate::session::Session;
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -20,11 +22,6 @@ const ROWS: usize = 25;
 const CELL_W: usize = 8;
 const CELL_H: usize = 16;
 const KEY_ATTR: u8 = 0x70;
-
-const PALETTE: [u32; 16] = [
-    0x000000, 0x0000AA, 0x00AA00, 0x00AAAA, 0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA, 0x555555,
-    0x5555FF, 0x55FF55, 0x55FFFF, 0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF,
-];
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -191,23 +188,55 @@ impl App {
     }
 }
 
-fn paint(buffer: &mut [u32], win_w: usize, win_h: usize, session: &Session) {
-    if win_w == 0 || win_h == 0 || buffer.len() < win_w.saturating_mul(win_h) {
-        return;
-    }
-    buffer[..win_w * win_h].fill(0);
-    let screen = session.screen();
-    let cols = screen.width();
-    let pix_w = cols * CELL_W;
-    let pix_h = ROWS * CELL_H;
+struct Frame {
+    scale: usize,
+    off_x: usize,
+    off_y: usize,
+    pix_w: usize,
+    pix_h: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CellRect {
+    x0: usize,
+    x1: usize,
+    y0: usize,
+    y1: usize,
+}
+
+fn frame_for(win_w: usize, win_h: usize, pix_w: usize, pix_h: usize) -> Frame {
     let mut scale = (win_w / pix_w).min(win_h / pix_h);
     if scale == 0 {
         scale = 1;
     }
     let dest_w = pix_w * scale;
     let dest_h = pix_h * scale;
-    let off_x = win_w.saturating_sub(dest_w) / 2;
-    let off_y = win_h.saturating_sub(dest_h) / 2;
+    Frame {
+        scale,
+        off_x: win_w.saturating_sub(dest_w) / 2,
+        off_y: win_h.saturating_sub(dest_h) / 2,
+        pix_w,
+        pix_h,
+    }
+}
+
+fn paint(buffer: &mut [u32], win_w: usize, win_h: usize, session: &Session) {
+    if win_w == 0 || win_h == 0 || buffer.len() < win_w.saturating_mul(win_h) {
+        return;
+    }
+    buffer[..win_w * win_h].fill(0);
+    let screen = session.screen();
+    if screen.graphics_mode() == 0 {
+        paint_text(buffer, win_w, win_h, session);
+    } else {
+        paint_graphics(buffer, win_w, win_h, session);
+    }
+}
+
+fn paint_text(buffer: &mut [u32], win_w: usize, win_h: usize, session: &Session) {
+    let screen = session.screen();
+    let cols = screen.width();
+    let frame = frame_for(win_w, win_h, cols * CELL_W, ROWS * CELL_H);
     let (cur_row, cur_col) = screen.cursor();
     let insert = screen.insert_mode();
     let strip = session.key_strip();
@@ -217,15 +246,13 @@ fn paint(buffer: &mut [u32], win_w: usize, win_h: usize, session: &Session) {
             let strip_row = row + 1 == ROWS && strip.is_some();
             let (ch, attr) = if strip_row {
                 (strip.as_ref().unwrap()[col], KEY_ATTR)
-            } else if row < ROWS {
+            } else {
                 let cell = screen.cell(row, col);
                 (cell.ch, cell.attr)
-            } else {
-                (b' ', 0x07)
             };
             let glyph = font::glyph(ch);
-            let fg = PALETTE[(attr & 0x0F) as usize];
-            let bg = PALETTE[((attr >> 4) & 0x0F) as usize];
+            let fg = EGA16[(attr & 0x0F) as usize];
+            let bg = EGA16[((attr >> 4) & 0x0F) as usize];
             let cursor_here = !strip_row && row == cur_row && col == cur_col;
             for (gy, bits) in glyph.iter().enumerate() {
                 let bits = *bits;
@@ -234,21 +261,163 @@ fn paint(buffer: &mut [u32], win_w: usize, win_h: usize, session: &Session) {
                 for gx in 0..CELL_W {
                     let on = font::pixel_on(bits, gx);
                     let color = if on { fg } else { bg };
-                    let x0 = off_x + (col * CELL_W + gx) * scale;
-                    let y0 = off_y + (row * CELL_H + gy) * scale;
-                    for dy in 0..scale {
-                        for dx in 0..scale {
-                            let x = x0 + dx;
-                            let y = y0 + dy;
-                            if x < win_w && y < win_h {
-                                buffer[y * win_w + x] = color;
-                            }
-                        }
-                    }
+                    stamp(
+                        buffer,
+                        win_w,
+                        win_h,
+                        &frame,
+                        col * CELL_W + gx,
+                        row * CELL_H + gy,
+                        color,
+                    );
                 }
             }
         }
     }
+}
+
+fn paint_graphics(buffer: &mut [u32], win_w: usize, win_h: usize, session: &Session) {
+    let screen = session.screen();
+    let (pix_w, pix_h) = screen.pixel_size();
+    if pix_w == 0 || pix_h == 0 {
+        return;
+    }
+    let frame = frame_for(win_w, win_h, pix_w, pix_h);
+    for y in 0..pix_h {
+        for x in 0..pix_w {
+            stamp(buffer, win_w, win_h, &frame, x, y, screen.pixel_rgb(x, y));
+        }
+    }
+    overlay_text(buffer, win_w, win_h, &frame, session);
+}
+
+fn overlay_text(buffer: &mut [u32], win_w: usize, win_h: usize, frame: &Frame, session: &Session) {
+    let screen = session.screen();
+    let cols = screen.width();
+    let (cur_row, cur_col) = screen.cursor();
+    let insert = screen.insert_mode();
+    let strip = session.key_strip();
+    for row in 0..ROWS {
+        let (y0, y1) = axis_span(row, ROWS, frame.pix_h);
+        if y0 == y1 {
+            continue;
+        }
+        let strip_row = row + 1 == ROWS && strip.is_some();
+        for col in 0..cols {
+            let (x0, x1) = axis_span(col, cols, frame.pix_w);
+            if x0 == x1 {
+                continue;
+            }
+            let rect = CellRect { x0, x1, y0, y1 };
+            if strip_row {
+                let ch = strip.as_ref().unwrap()[col];
+                blit_cell(
+                    buffer,
+                    (win_w, win_h),
+                    frame,
+                    rect,
+                    ch,
+                    EGA16[(KEY_ATTR & 0x0F) as usize],
+                    Some(EGA16[((KEY_ATTR >> 4) & 0x0F) as usize]),
+                );
+                continue;
+            }
+            let cell = screen.cell(row, col);
+            if cell.ch != b' ' {
+                blit_cell(
+                    buffer,
+                    (win_w, win_h),
+                    frame,
+                    rect,
+                    cell.ch,
+                    screen.attribute_rgb(cell.attr),
+                    None,
+                );
+            }
+            if row == cur_row && col == cur_col {
+                invert_cell(buffer, (win_w, win_h), frame, rect, insert);
+            }
+        }
+    }
+}
+
+fn blit_cell(
+    buffer: &mut [u32],
+    win: (usize, usize),
+    frame: &Frame,
+    rect: CellRect,
+    ch: u8,
+    fg: u32,
+    bg: Option<u32>,
+) {
+    let (win_w, win_h) = win;
+    let glyph = font::glyph(ch);
+    let gw = rect.x1 - rect.x0;
+    let gh = rect.y1 - rect.y0;
+    for y in rect.y0..rect.y1 {
+        let sy = (y - rect.y0) * 16 / gh;
+        let bits = glyph[sy.min(15)];
+        for x in rect.x0..rect.x1 {
+            let sx = (x - rect.x0) * 8 / gw;
+            let on = font::pixel_on(bits, sx.min(7));
+            if on {
+                stamp(buffer, win_w, win_h, frame, x, y, fg);
+            } else if let Some(bg) = bg {
+                stamp(buffer, win_w, win_h, frame, x, y, bg);
+            }
+        }
+    }
+}
+
+fn invert_cell(
+    buffer: &mut [u32],
+    win: (usize, usize),
+    frame: &Frame,
+    rect: CellRect,
+    insert: bool,
+) {
+    let (win_w, win_h) = win;
+    let height = rect.y1 - rect.y0;
+    for y in rect.y0..rect.y1 {
+        if insert && (y - rect.y0) * 2 < height {
+            continue;
+        }
+        for x in rect.x0..rect.x1 {
+            let wx = frame.off_x + x * frame.scale;
+            let wy = frame.off_y + y * frame.scale;
+            if wx >= win_w || wy >= win_h {
+                continue;
+            }
+            let color = buffer[wy * win_w + wx] ^ 0x00FF_FFFF;
+            stamp(buffer, win_w, win_h, frame, x, y, color);
+        }
+    }
+}
+
+fn stamp(
+    buffer: &mut [u32],
+    win_w: usize,
+    win_h: usize,
+    frame: &Frame,
+    x: usize,
+    y: usize,
+    color: u32,
+) {
+    let x0 = frame.off_x + x * frame.scale;
+    let y0 = frame.off_y + y * frame.scale;
+    for dy in 0..frame.scale {
+        for dx in 0..frame.scale {
+            let px = x0 + dx;
+            let py = y0 + dy;
+            if px < win_w && py < win_h {
+                buffer[py * win_w + px] = color;
+            }
+        }
+    }
+}
+
+fn axis_span(index: usize, count: usize, total: usize) -> (usize, usize) {
+    (index * total / count, (index + 1) * total / count)
 }
 
 fn map_key(event: &KeyEvent, mods: ModifiersState) -> Option<Input> {

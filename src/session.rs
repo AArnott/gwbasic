@@ -512,7 +512,6 @@ impl Session {
                 session.trace = false;
                 session.print_ok();
             }),
-            "SCREEN" => self.cmd_screen(rest),
             "WIDTH" => self.cmd_width(rest),
             "CLS" => self.cmd_bare(rest, |session| {
                 session.screen.clear();
@@ -859,40 +858,6 @@ impl Session {
         }
     }
 
-    fn cmd_screen(&mut self, rest: &str) {
-        let rest = rest.trim();
-        if rest.is_empty() {
-            self.error(SYNTAX);
-            return;
-        }
-        let mut parts = rest.split(',');
-        let Some(mode_text) = parts.next() else {
-            self.error(SYNTAX);
-            return;
-        };
-        let Ok(mode) = parse_u32_token(mode_text.trim()) else {
-            self.error(SYNTAX);
-            return;
-        };
-        // Graphics modes wait. SCREEN 0 is the text screen, and it clears.
-        if mode != 0 {
-            self.error(ILLEGAL);
-            return;
-        }
-        for part in parts {
-            let part = part.trim();
-            if part.is_empty() {
-                continue;
-            }
-            if parse_u32_token(part).is_err() {
-                self.error(SYNTAX);
-                return;
-            }
-        }
-        self.screen.clear();
-        self.print_ok();
-    }
-
     fn cmd_width(&mut self, rest: &str) {
         let rest = rest.trim();
         let Some((width, after)) = take_u32(rest) else {
@@ -907,7 +872,10 @@ impl Session {
             self.error(ILLEGAL);
             return;
         }
-        self.screen.set_width(width as usize);
+        if !self.screen.set_width(width as usize) {
+            self.error(ILLEGAL);
+            return;
+        }
         self.keys.offset = 0;
         self.print_ok();
     }
@@ -2015,5 +1983,262 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn has_line(session: &Session, line: &str) {
+        assert!(
+            session.snapshot().lines().any(|row| row == line),
+            "missing {line:?} in:\n{}",
+            session.snapshot()
+        );
+    }
+
+    #[test]
+    fn screen_1_plots_and_maps_points() {
+        let mut center = fresh();
+        center.type_ascii("SCREEN 1\nPRINT POINT(0);POINT(1);POINT(2);POINT(3)\n");
+        has_line(&center, " 160  100  160  100");
+
+        let mut plotted = fresh();
+        plotted.type_ascii(
+            "SCREEN 1\n\
+             PSET(0,0)\n\
+             PRINT POINT(0,0)\n\
+             PRESET(0,0)\n\
+             PRINT POINT(0,0)\n\
+             PSET(0,0),1\n\
+             PRINT POINT(0,0);POINT(-1,0);POINT(0,200)\n",
+        );
+        has_line(&plotted, " 3");
+        has_line(&plotted, " 0");
+        has_line(&plotted, " 1 -1 -1");
+
+        let mut stepped = fresh();
+        stepped.type_ascii(
+            "SCREEN 1\n\
+             PSET(4,5)\n\
+             PSET STEP(1,2)\n\
+             PRINT POINT(0);POINT(1)\n\
+             PRINT PMAP(3,0);PMAP(4,1)\n",
+        );
+        has_line(&stepped, " 5  7");
+        has_line(&stepped, " 3  4");
+
+        let mut up = fresh();
+        up.type_ascii("SCREEN 1\nWINDOW (0,0)-(319,199)\nPRINT PMAP(0,1);PMAP(199,1)\n");
+        has_line(&up, " 199  0");
+
+        let mut down = fresh();
+        down.type_ascii("SCREEN 1\nWINDOW SCREEN (0,0)-(319,199)\nPRINT PMAP(0,1);PMAP(199,1)\n");
+        has_line(&down, " 0  199");
+
+        let mut view = fresh();
+        view.type_ascii(
+            "SCREEN 1\n\
+             VIEW (10,10)-(100,100)\n\
+             PSET(0,0),1\n\
+             PRINT POINT(0,0);POINT(90,0);POINT(0,-1)\n",
+        );
+        has_line(&view, " 1  0 -1");
+
+        let mut reset = fresh();
+        reset.type_ascii("SCREEN 1\nPSET(1,1)\nVIEW\nPRINT POINT(0);POINT(1)\n");
+        has_line(&reset, " 160  100");
+
+        let mut wide = fresh();
+        wide.type_ascii(
+            "SCREEN 2\n\
+             PSET(400,10)\n\
+             PRINT POINT(400,10);POINT(639,0);POINT(640,0)\n\
+             PRINT POINT(0)\n",
+        );
+        has_line(&wide, " 1  0 -1");
+        has_line(&wide, " 400");
+    }
+
+    #[test]
+    fn screen_0_keeps_the_pen_and_text_reads_cells() {
+        let mut session = fresh();
+        session.type_ascii("PRINT \"HI\"\nSCREEN 0,0,0\n");
+        assert_eq!(session.snapshot(), "Ok");
+
+        let mut kept = fresh();
+        kept.type_ascii(
+            "SCREEN 2\n\
+             PSET(400,10)\n\
+             SCREEN 0\n\
+             PRINT POINT(0);PMAP(9,0)\n\
+             PRINT POINT(1,1)\n",
+        );
+        has_line(&kept, " 400  0");
+        assert!(kept.snapshot().contains(ILLEGAL), "{}", kept.snapshot());
+
+        let mut narrow = fresh();
+        narrow.type_ascii("SCREEN 1\nSCREEN 0\nPRINT SCREEN(1,41)\n");
+        assert!(narrow.snapshot().contains(ILLEGAL), "{}", narrow.snapshot());
+        assert!(
+            !narrow.snapshot().lines().any(|line| line == " 32"),
+            "{}",
+            narrow.snapshot()
+        );
+
+        let mut cells = fresh();
+        cells.type_ascii(
+            "10 CLS\n20 PRINT \"AB\"\n30 PRINT SCREEN(1,1);SCREEN(1,2);SCREEN(1,1,1)\nRUN\n",
+        );
+        has_line(&cells, " 65  66  7");
+
+        let mut key_row = fresh();
+        key_row.type_ascii("PRINT SCREEN(25,1)\n");
+        assert!(
+            key_row.snapshot().contains(ILLEGAL),
+            "{}",
+            key_row.snapshot()
+        );
+        key_row.type_ascii("KEY OFF\nPRINT SCREEN(25,1)\n");
+        has_line(&key_row, " 32");
+
+        let mut bad_cell = fresh();
+        bad_cell.type_ascii("PRINT SCREEN(0,1)\n");
+        assert!(
+            bad_cell.snapshot().contains(ILLEGAL),
+            "{}",
+            bad_cell.snapshot()
+        );
+    }
+
+    #[test]
+    fn bad_graphics_modes_do_not_clear_and_syntax_is_not_stored() {
+        let mut session = fresh();
+        session.type_ascii("PRINT \"HI\"\nSCREEN 3\n");
+        assert!(
+            session.snapshot().lines().any(|line| line == "HI"),
+            "{}",
+            session.snapshot()
+        );
+        assert!(
+            session.snapshot().contains(ILLEGAL),
+            "{}",
+            session.snapshot()
+        );
+
+        let mut huge = fresh();
+        huge.type_ascii("PRINT \"HI\"\nSCREEN 99\n");
+        assert!(huge.snapshot().lines().any(|line| line == "HI"));
+        assert!(huge.snapshot().contains(ILLEGAL));
+
+        let mut program = fresh();
+        program.type_ascii("10 PRINT \"HI\"\n20 SCREEN 3\nRUN\n");
+        assert!(program.snapshot().lines().any(|line| line == "HI"));
+        assert!(program.snapshot().contains("Illegal function call in 20"));
+
+        let mut page = fresh();
+        page.type_ascii("SCREEN 1\nPSET(0,0),1\nSCREEN 1,0,1\nPRINT POINT(0,0)\n");
+        has_line(&page, " 1");
+        assert!(page.snapshot().contains(ILLEGAL), "{}", page.snapshot());
+
+        let mut drawn = fresh();
+        drawn.type_ascii("10 SCREEN 1\n20 PSET (0,0),2\n30 PRINT POINT(0,0)\nRUN\n");
+        assert_eq!(drawn.snapshot(), " 2\nOk");
+
+        let mut palette = fresh();
+        palette.type_ascii("10 PALETTE USING A\n");
+        assert!(palette.program_line(10).is_none());
+        assert!(palette.snapshot().contains(SYNTAX));
+
+        let mut view = fresh();
+        view.type_ascii("10 VIEW PRINT 1 TO 24\n");
+        assert!(view.program_line(10).is_none());
+        assert!(view.snapshot().contains(SYNTAX));
+
+        let mut stored = fresh();
+        stored.type_ascii("10 PSET(0,0)\nRUN\n");
+        assert!(stored.program_line(10).is_some());
+        assert!(stored.snapshot().contains("Illegal function call in 10"));
+
+        let mut overflow = fresh();
+        overflow.type_ascii("PRINT POINT(32768,0)\nPRINT PMAP(1,4)\nPRINT PMAP(1,\"A\")\n");
+        assert!(
+            overflow.snapshot().contains("Overflow"),
+            "{}",
+            overflow.snapshot()
+        );
+        assert!(
+            overflow.snapshot().contains(ILLEGAL),
+            "{}",
+            overflow.snapshot()
+        );
+        assert!(
+            overflow.snapshot().contains("Type mismatch"),
+            "{}",
+            overflow.snapshot()
+        );
+    }
+
+    #[test]
+    fn width_switches_paired_graphics_modes() {
+        let mut session = fresh();
+        session.type_ascii("SCREEN 1\nWIDTH 80\nPRINT POINT(400,0)\n");
+        has_line(&session, " 0");
+        assert!(!session.snapshot().lines().any(|line| line == " -1"));
+
+        let mut program = fresh();
+        program.type_ascii("10 SCREEN 1\n20 WIDTH 80\n30 PRINT POINT(400,0)\nRUN\n");
+        assert_eq!(program.snapshot(), " 0\nOk");
+
+        let mut stuck = fresh();
+        stuck.type_ascii("SCREEN 11\nWIDTH 40\nPRINT POINT(400,0)\n");
+        assert!(stuck.snapshot().contains(ILLEGAL), "{}", stuck.snapshot());
+        has_line(&stuck, " 0");
+        assert!(!stuck.snapshot().lines().any(|line| line == " -1"));
+
+        let mut down = fresh();
+        down.type_ascii("SCREEN 9\nWIDTH 40\nPRINT POINT(0)\nPSET(0,0)\nPRINT POINT(0,0)\n");
+        has_line(&down, " 160");
+        has_line(&down, " 15");
+    }
+
+    #[test]
+    fn color_and_palette_check_their_ranges() {
+        let mut cga = fresh();
+        cga.type_ascii("SCREEN 1\nCOLOR 256\n");
+        assert!(cga.snapshot().contains(ILLEGAL), "{}", cga.snapshot());
+
+        let mut mono = fresh();
+        mono.type_ascii("SCREEN 2\nCOLOR 1\n");
+        assert!(mono.snapshot().contains(ILLEGAL), "{}", mono.snapshot());
+
+        let mut text = fresh();
+        text.type_ascii("PALETTE 1,1\n");
+        assert!(text.snapshot().contains(ILLEGAL), "{}", text.snapshot());
+
+        let mut range = fresh();
+        range.type_ascii("SCREEN 1\nPALETTE 4,1\nPALETTE 1,-2\n");
+        assert!(range.snapshot().contains(ILLEGAL), "{}", range.snapshot());
+
+        let mut kept = fresh();
+        kept.type_ascii(
+            "SCREEN 1\n\
+             PALETTE 1,-1\n\
+             PALETTE\n\
+             COLOR ,0\n\
+             PSET(0,0)\n\
+             PRINT POINT(0,0)\n\
+             PSET(0,0),9\n\
+             PRINT POINT(0,0)\n\
+             PRESET(0,0),2\n\
+             PRINT POINT(0,0)\n",
+        );
+        assert!(!kept.snapshot().contains(ILLEGAL), "{}", kept.snapshot());
+        has_line(&kept, " 3");
+        has_line(&kept, " 2");
+
+        let mut clamped = fresh();
+        clamped.type_ascii("SCREEN 1\nPSET(0,0),256\n");
+        assert!(
+            clamped.snapshot().contains(ILLEGAL),
+            "{}",
+            clamped.snapshot()
+        );
     }
 }
