@@ -1617,4 +1617,162 @@ mod tests {
         data.type_ascii("10 READ A$\n20 PRINT A$\n30 DATA Hello\n40 END\nRUN\n");
         assert!(data.snapshot().lines().any(|line| line == "Hello"));
     }
+
+    #[test]
+    fn renum_rewrites_refs_and_refuses_to_reorder() {
+        let mut session = fresh();
+        session.type_ascii(
+            "10 GOTO 40\n20 ON X GOTO 40,50\n30 IF A=0 THEN 40 ELSE 50\n40 RESUME 50\n50 END\n",
+        );
+        session.type_ascii("RENUM 100,,10\n");
+        assert_eq!(session.program_line(100), Some("100 GOTO 130"));
+        assert_eq!(session.program_line(110), Some("110 ON X GOTO 130,140"));
+        assert_eq!(
+            session.program_line(120),
+            Some("120 IF A=0 THEN 130 ELSE 140")
+        );
+        assert_eq!(session.program_line(130), Some("130 RESUME 140"));
+        assert_eq!(session.program_line(140), Some("140 END"));
+        assert!(session.program_line(10).is_none());
+
+        let mut undef = fresh();
+        undef.type_ascii("10 GOTO 99\n20 END\nRENUM 100\n");
+        let snap = undef.snapshot();
+        assert!(snap.contains("Undefined line 99 in 100"), "{snap}");
+        assert_eq!(undef.program_line(100), Some("100 GOTO 99"));
+        assert_eq!(undef.program_line(110), Some("110 END"));
+
+        let mut bad = fresh();
+        bad.type_ascii("10 REM\n20 REM\n30 REM\nRENUM 15,30\n");
+        assert!(bad.snapshot().contains(ILLEGAL));
+        assert_eq!(bad.program_line(10), Some("10 REM"));
+        assert_eq!(bad.program_line(20), Some("20 REM"));
+        assert_eq!(bad.program_line(30), Some("30 REM"));
+
+        let mut missing_old = fresh();
+        missing_old.type_ascii("10 REM\nRENUM ,50\n");
+        assert!(missing_old.snapshot().contains("Undefined line number"));
+        assert_eq!(missing_old.program_line(10), Some("10 REM"));
+
+        let mut inside = fresh();
+        inside.type_ascii("10 RENUM\n20 END\nRUN\n");
+        assert!(inside.snapshot().contains(ILLEGAL));
+        assert_eq!(inside.program_line(10), Some("10 RENUM"));
+        assert_eq!(inside.program_line(20), Some("20 END"));
+
+        let mut moved = fresh();
+        moved.type_ascii("0 REM\n10 GOTO 0\n20 ON ERROR GOTO 0\nRENUM 100\n");
+        let snap = moved.snapshot();
+        assert!(!snap.contains("Undefined line 0"), "{snap}");
+        assert_eq!(moved.program_line(100), Some("100 REM"));
+        assert_eq!(moved.program_line(110), Some("110 GOTO 100"));
+        assert_eq!(moved.program_line(120), Some("120 ON ERROR GOTO 0"));
+
+        let dir = std::env::temp_dir().join("gwbasic-milestone4-renum");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("P.BAS");
+        let mut protected = fresh();
+        protected.type_ascii("20 REM\n");
+        protected.type_ascii(&format!("SAVE \"{}\",P\n", path.display()));
+        protected.type_ascii("NEW\n");
+        protected.type_ascii(&format!("LOAD \"{}\"\n", path.display()));
+        protected.type_ascii("RENUM 100\n");
+        assert!(protected.snapshot().contains(ILLEGAL));
+        assert_eq!(protected.program_line(20), Some("20 REM"));
+        assert!(protected.program_line(100).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_line_continues_at_that_line() {
+        let mut session = fresh();
+        session.type_ascii(
+            "10 ON ERROR GOTO 50\n20 ERROR 5\n30 PRINT \"AFTER\"\n40 END\n50 PRINT \"TRAP\"\n60 RESUME 30\nRUN\n",
+        );
+        let snap = session.snapshot();
+        assert!(snap.lines().any(|line| line == "TRAP"), "{snap}");
+        assert!(snap.lines().any(|line| line == "AFTER"), "{snap}");
+    }
+
+    #[test]
+    fn lset_and_rset_keep_the_current_length() {
+        let mut session = fresh();
+        session.type_ascii(
+            "A$=\"ABCD\"\nLSET A$=\"XA\"\nPRINT LEN(A$);ASC(A$);ASC(MID$(A$,2));ASC(MID$(A$,4))\n",
+        );
+        assert!(session
+            .snapshot()
+            .lines()
+            .any(|line| line == " 4  88  65  32"));
+
+        let mut right = fresh();
+        right.type_ascii("A$=\"ABCD\"\nRSET A$=\"XA\"\nPRINT ASC(A$);ASC(RIGHT$(A$,1))\n");
+        assert!(right.snapshot().lines().any(|line| line == " 32  65"));
+
+        let mut empty = fresh();
+        empty.type_ascii("LSET B$=\"HI\"\nPRINT LEN(B$)\n");
+        assert!(empty.snapshot().lines().any(|line| line == " 0"));
+
+        let mut bad = fresh();
+        bad.type_ascii("A%=1\nLSET A%=\"HI\"\n");
+        assert!(bad.snapshot().contains("Type mismatch"));
+    }
+
+    #[test]
+    fn conversions_environ_and_reset() {
+        let mut session = fresh();
+        session.type_ascii("A$=MKI$(65)\nPRINT LEN(A$);CVI(A$)\n");
+        assert!(session.snapshot().lines().any(|line| line == " 2  65"));
+        session.type_ascii("PRINT CVI(MKI$(-1))\n");
+        assert!(session.snapshot().lines().any(|line| line == "-1"));
+        session.type_ascii("PRINT CVI(MKI$(65)+\"Z\")\n");
+        assert!(session.snapshot().lines().any(|line| line == " 65"));
+
+        let mut wide = fresh();
+        wide.type_ascii("A$=MKS$(1)\nB$=MKD$(1)\nPRINT LEN(A$);CVS(A$)\nPRINT LEN(B$);CVD(B$)\n");
+        let snap = wide.snapshot();
+        assert!(snap.lines().any(|line| line == " 4  1"), "{snap}");
+        assert!(snap.lines().any(|line| line == " 8  1"), "{snap}");
+
+        let mut short = fresh();
+        short.type_ascii("PRINT CVI(\"A\")\n");
+        assert!(short.snapshot().contains(ILLEGAL));
+
+        let mut env = fresh();
+        env.type_ascii(
+            "ENVIRON \"GWTEST4=hi\"\nPRINT ENVIRON$(\"gwtest4\")\nENVIRON \"GWTEST4=\"\nPRINT LEN(ENVIRON$(\"GWTEST4\"))\n",
+        );
+        let snap = env.snapshot();
+        assert!(snap.lines().any(|line| line == "hi"), "{snap}");
+        assert!(snap.lines().any(|line| line == " 0"), "{snap}");
+
+        let mut bad = fresh();
+        bad.type_ascii("ENVIRON \"NOPE\"\n");
+        assert!(bad.snapshot().contains(ILLEGAL));
+
+        let shell = if cfg!(windows) {
+            "SHELL \"echo %GWTEST4%\"\n"
+        } else {
+            "SHELL \"echo $GWTEST4\"\n"
+        };
+        let mut child = fresh();
+        child.type_ascii("ENVIRON \"GWTEST4=hi\"\n");
+        child.type_ascii(shell);
+        assert!(
+            child.snapshot().lines().any(|line| line == "hi"),
+            "{}",
+            child.snapshot()
+        );
+
+        let dir = std::env::temp_dir().join("gwbasic-milestone4");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.txt");
+        let mut reset = fresh();
+        reset.type_ascii(&format!("OPEN \"{}\" FOR OUTPUT AS #1\n", path.display()));
+        reset.type_ascii("RESET\nPRINT EOF(1)\n");
+        assert!(reset.snapshot().contains("Bad file mode"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

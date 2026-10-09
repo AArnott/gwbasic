@@ -3,14 +3,15 @@
 //! Spaces outside strings, `REM`, and `DATA` are not stored. `'` is stored as
 //! the `:REM'` sequence. `WHILE` is followed by a hidden `+`. `ELSE` is stored
 //! as colon + `ELSE`, and listings hide that colon. Keywords come back in
-//! uppercase. A line number after `GOTO`, `GOSUB`, `THEN`, `ELSE`, or
-//! `RESTORE` is the `0x0E` operand, not an integer constant.
+//! uppercase. A line number after `GOTO`, `GOSUB`, `THEN`, `ELSE`, `RESTORE`,
+//! or `RESUME` is the `0x0E` operand, not an integer constant.
 
 use crate::mbf::Mbf;
 use crate::tokens::{
     self, emit_keyword, find_keyword, keyword_name, T_BYTE, T_COLON, T_DATA, T_DBL, T_ELSE, T_HEX,
     T_I16, T_INT0, T_LINE, T_OCT, T_PLUS, T_QUOTE, T_REM, T_SNG, T_TICK, T_WHILE,
 };
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FaultKind {
@@ -168,7 +169,7 @@ pub fn crunch(source: &str) -> Result<Vec<u8>, Fault> {
                     out.push(T_PLUS);
                     continue;
                 }
-                "GOTO" | "GOSUB" | "THEN" | "RESTORE" => {
+                "GOTO" | "GOSUB" | "THEN" | "RESTORE" | "RESUME" => {
                     emit_keyword(&mut out, kw);
                     line_mode = true;
                     continue;
@@ -184,7 +185,7 @@ pub fn crunch(source: &str) -> Result<Vec<u8>, Fault> {
             continue;
         }
         match src[i] {
-            b'(' | b')' | b',' | b';' | b'#' => {
+            b'(' | b')' | b',' | b';' | b'#' | b'$' => {
                 out.push(src[i]);
                 i += 1;
             }
@@ -373,6 +374,252 @@ fn emit_int(out: &mut Vec<u8>, n: i16) {
     } else {
         out.push(T_I16);
         out.extend_from_slice(&n.to_le_bytes());
+    }
+}
+
+fn emit_renumbered_const(out: &mut Vec<u8>, n: u16) {
+    if let Ok(narrow) = i16::try_from(n) {
+        emit_int(out, narrow);
+    } else {
+        let value = Mbf::from_i32(i32::from(n), false);
+        out.push(T_SNG);
+        out.extend_from_slice(&value.to_le_single());
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ErlScan {
+    No,
+    Name,
+    Rel,
+}
+
+/// Rewrite line-number operands after `RENUM`.
+///
+/// A `T_LINE` that names a renumbered line is replaced. One that names no line
+/// in `present` is left as written and returned. `ON ERROR GOTO 0` disables
+/// trapping, so that zero is not a reference to line 0. An integer compared
+/// with `ERL` is updated when it names a renumbered line, and is not reported
+/// when it does not. `REM`, remarks, `DATA`, and quoted strings are copied
+/// through.
+pub fn retarget_lines(
+    tokens: &[u8],
+    map: &BTreeMap<u16, u16>,
+    present: &BTreeSet<u16>,
+) -> (Vec<u8>, Vec<u16>) {
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut missing = Vec::new();
+    let mut i = 0;
+    let mut erl = ErlScan::No;
+    let mut recent = ["", "", ""];
+    while i < tokens.len() {
+        let b = tokens[i];
+        if b == 0 {
+            out.push(0);
+            break;
+        }
+        if b == b' ' {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        if erl != ErlScan::No && is_relation(b) {
+            out.push(b);
+            i += 1;
+            erl = ErlScan::Rel;
+            if let Some(name) = keyword_name(0, b) {
+                push_recent(&mut recent, name);
+            }
+            continue;
+        }
+        if erl == ErlScan::Rel {
+            if let Some((value, len)) = int_at(tokens, i) {
+                if (0..=32767).contains(&value) {
+                    let old = u16::try_from(value).unwrap_or(0);
+                    if let Some(&new_n) = map.get(&old) {
+                        emit_renumbered_const(&mut out, new_n);
+                        i += len;
+                        erl = ErlScan::No;
+                        continue;
+                    }
+                }
+                if !copy_width(&mut out, tokens, &mut i, len) {
+                    break;
+                }
+                erl = ErlScan::No;
+                continue;
+            }
+        }
+        erl = ErlScan::No;
+        if b == T_COLON && tokens.get(i + 1) == Some(&T_REM) && tokens.get(i + 2) == Some(&T_TICK) {
+            if !copy_width(&mut out, tokens, &mut i, 3) {
+                break;
+            }
+            copy_until_zero(&mut out, tokens, &mut i);
+            continue;
+        }
+        if b == T_REM {
+            out.push(b);
+            i += 1;
+            copy_until_zero(&mut out, tokens, &mut i);
+            continue;
+        }
+        if b == T_DATA {
+            out.push(b);
+            i += 1;
+            copy_data(&mut out, tokens, &mut i);
+            continue;
+        }
+        if b == T_QUOTE {
+            out.push(b);
+            i += 1;
+            while i < tokens.len() && tokens[i] != T_QUOTE && tokens[i] != 0 {
+                out.push(tokens[i]);
+                i += 1;
+            }
+            if tokens.get(i) == Some(&T_QUOTE) {
+                out.push(T_QUOTE);
+                i += 1;
+            }
+            continue;
+        }
+        if b == T_LINE {
+            if i + 3 > tokens.len() {
+                out.extend_from_slice(&tokens[i..]);
+                break;
+            }
+            let n = u16::from_le_bytes([tokens[i + 1], tokens[i + 2]]);
+            i += 3;
+            let disable = n == 0 && recent == ["ON", "ERROR", "GOTO"];
+            let rewritten = if disable {
+                n
+            } else {
+                map.get(&n).copied().unwrap_or(n)
+            };
+            if !disable && !map.contains_key(&n) && !present.contains(&n) {
+                missing.push(n);
+            }
+            out.push(T_LINE);
+            out.extend_from_slice(&rewritten.to_le_bytes());
+            continue;
+        }
+        if matches!(b, 0xFD..=0xFF) {
+            let prefix = b;
+            let code = tokens.get(i + 1).copied().unwrap_or(0);
+            if !copy_width(&mut out, tokens, &mut i, 2) {
+                break;
+            }
+            if let Some(name) = keyword_name(prefix, code) {
+                push_recent(&mut recent, name);
+            }
+            continue;
+        }
+        if (0x80..=0xFC).contains(&b) {
+            out.push(b);
+            i += 1;
+            if let Some(name) = keyword_name(0, b) {
+                push_recent(&mut recent, name);
+                if name == "ERL" {
+                    erl = ErlScan::Name;
+                }
+            }
+            continue;
+        }
+        if let Some((_, len)) = int_at(tokens, i) {
+            if !copy_width(&mut out, tokens, &mut i, len) {
+                break;
+            }
+            continue;
+        }
+        let width = match b {
+            T_OCT | T_HEX => 3,
+            T_SNG => 5,
+            T_DBL => 9,
+            _ => 1,
+        };
+        if width > 1 {
+            if !copy_width(&mut out, tokens, &mut i, width) {
+                break;
+            }
+            continue;
+        }
+        if b.is_ascii_alphabetic() {
+            let start = i;
+            i += 1;
+            while tokens.get(i).is_some_and(|c| c.is_ascii_alphanumeric()) {
+                i += 1;
+            }
+            if tokens
+                .get(i)
+                .is_some_and(|c| matches!(c, b'%' | b'!' | b'$'))
+            {
+                i += 1;
+            }
+            out.extend_from_slice(&tokens[start..i]);
+            continue;
+        }
+        out.push(b);
+        i += 1;
+    }
+    (out, missing)
+}
+
+fn push_recent(recent: &mut [&'static str; 3], name: &'static str) {
+    recent[0] = recent[1];
+    recent[1] = recent[2];
+    recent[2] = name;
+}
+
+fn is_relation(b: u8) -> bool {
+    matches!(keyword_name(0, b), Some("<" | "=" | ">"))
+}
+
+fn int_at(tokens: &[u8], i: usize) -> Option<(i16, usize)> {
+    let b = *tokens.get(i)?;
+    if (T_INT0..=T_INT0 + 10).contains(&b) {
+        return Some((i16::from(b - T_INT0), 1));
+    }
+    if b == T_BYTE {
+        return Some((i16::from(*tokens.get(i + 1)?), 2));
+    }
+    if b == T_I16 {
+        let lo = *tokens.get(i + 1)?;
+        let hi = *tokens.get(i + 2)?;
+        return Some((i16::from_le_bytes([lo, hi]), 3));
+    }
+    None
+}
+
+fn copy_width(out: &mut Vec<u8>, tokens: &[u8], i: &mut usize, n: usize) -> bool {
+    if *i + n > tokens.len() {
+        out.extend_from_slice(&tokens[*i..]);
+        *i = tokens.len();
+        false
+    } else {
+        out.extend_from_slice(&tokens[*i..*i + n]);
+        *i += n;
+        true
+    }
+}
+
+fn copy_until_zero(out: &mut Vec<u8>, tokens: &[u8], i: &mut usize) {
+    while *i < tokens.len() && tokens[*i] != 0 {
+        out.push(tokens[*i]);
+        *i += 1;
+    }
+}
+
+fn copy_data(out: &mut Vec<u8>, tokens: &[u8], i: &mut usize) {
+    let mut quoted = false;
+    while *i < tokens.len() && tokens[*i] != 0 {
+        let b = tokens[*i];
+        if b == T_QUOTE {
+            quoted = !quoted;
+        } else if b == T_COLON && !quoted {
+            break;
+        }
+        out.push(b);
+        *i += 1;
     }
 }
 
@@ -690,7 +937,12 @@ fn space_after(tok: &Tok, next: Option<&Tok>) -> bool {
             }
             !matches!(
                 next,
-                Tok::Colon | Tok::Punct(b',') | Tok::Punct(b';') | Tok::Punct(b')') | Tok::End
+                Tok::Colon
+                    | Tok::Punct(b',')
+                    | Tok::Punct(b';')
+                    | Tok::Punct(b')')
+                    | Tok::Punct(b'$')
+                    | Tok::End
             )
         }
         _ => false,
@@ -734,5 +986,41 @@ mod tests {
         assert_eq!(round_trip(" ' hi"), "' hi");
         assert_eq!(round_trip(" FOR I=1 TO 10"), "FOR I=1 TO 10");
         assert_eq!(round_trip(" A=1"), "A=1");
+    }
+
+    #[test]
+    fn resume_and_environ_dollar_round_trip_and_renumber_patches_refs() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let tokens = crunch("RESUME 40").unwrap();
+        assert!(tokens
+            .windows(3)
+            .any(|w| { w[0] == crate::tokens::T_LINE && u16::from_le_bytes([w[1], w[2]]) == 40 }));
+        assert_eq!(round_trip("ENVIRON$(\"A\")"), "ENVIRON$(\"A\")");
+
+        let mut map = BTreeMap::new();
+        map.insert(0, 100);
+        let present = BTreeSet::from([0]);
+        let (out, missing) = retarget_lines(&crunch("ON ERROR GOTO 0").unwrap(), &map, &present);
+        assert!(missing.is_empty());
+        assert_eq!(list_tokens(&out), "ON ERROR GOTO 0");
+        let (out, missing) = retarget_lines(&crunch("GOTO 0").unwrap(), &map, &present);
+        assert!(missing.is_empty());
+        assert_eq!(list_tokens(&out), "GOTO 100");
+
+        let mut map = BTreeMap::new();
+        map.insert(30, 110);
+        let present = BTreeSet::from([30]);
+        let (out, missing) = retarget_lines(&crunch("GOTO 99").unwrap(), &map, &present);
+        assert_eq!(missing, vec![99]);
+        assert_eq!(list_tokens(&out), "GOTO 99");
+        let (out, missing) = retarget_lines(&crunch("IF ERL=30 THEN END").unwrap(), &map, &present);
+        assert!(missing.is_empty());
+        assert_eq!(list_tokens(&out), "IF ERL =110 THEN END");
+        let (out, missing) = retarget_lines(&crunch("DATA 30").unwrap(), &map, &present);
+        assert!(missing.is_empty());
+        assert_eq!(list_tokens(&out), "DATA 30");
+        let (out, _) = retarget_lines(&crunch("REM GOTO 30").unwrap(), &map, &present);
+        assert_eq!(list_tokens(&out), "REM GOTO 30");
     }
 }

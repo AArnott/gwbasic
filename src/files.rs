@@ -415,20 +415,25 @@ pub fn rmdir(path: &str) -> Result<(), &'static str> {
     std::fs::remove_dir(plain_path(path)?).map_err(io_err)
 }
 
-pub fn run_shell(command: &str) -> Result<String, &'static str> {
+pub fn run_shell(command: &str, env: &[(String, String)]) -> Result<String, &'static str> {
     if command.trim().is_empty() {
         return Ok(String::new());
     }
-    let output = if cfg!(windows) {
-        std::process::Command::new("cmd")
-            .args(["/C", command])
-            .output()
+    let (program, flag) = if cfg!(windows) {
+        ("cmd", "/C")
     } else {
-        std::process::Command::new("sh")
-            .args(["-c", command])
-            .output()
-    }
-    .map_err(|_| PATH_FILE_ACCESS)?;
+        ("sh", "-c")
+    };
+    let output = std::process::Command::new(program)
+        .arg(flag)
+        .arg(command)
+        .env_clear()
+        .envs(
+            env.iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )
+        .output()
+        .map_err(|_| PATH_FILE_ACCESS)?;
     let mut text = String::new();
     text.push_str(&String::from_utf8_lossy(&output.stdout));
     if !output.status.success() {

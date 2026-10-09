@@ -7,7 +7,7 @@ use crate::files::{self, Files, SaveKind, SeqMode};
 use crate::mbf::{MathError, Mbf};
 use crate::program::Program;
 use crate::screen::Screen;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 pub const SYNTAX: &str = "Syntax error";
 const MISSING: &str = "Missing operand";
@@ -201,6 +201,13 @@ enum Func {
     Eof,
     Lof,
     Loc,
+    Mki,
+    Mks,
+    Mkd,
+    Cvi,
+    Cvs,
+    Cvd,
+    Environ,
     /// A tokenized function this milestone does not implement (`VARPTR`, `INP`, …).
     Unsupported,
 }
@@ -339,6 +346,9 @@ pub struct Vm {
     on_error: Option<u16>,
     handling_error: bool,
     resume_at: Option<Ip>,
+    /// Process environment captured at startup. `ENVIRON` edits this copy.
+    /// `SHELL` passes it to the child. `RUN` and `CLEAR` do not reset it.
+    environ: Vec<(String, String)>,
 }
 
 pub struct Host<'a> {
@@ -408,6 +418,7 @@ impl Vm {
             on_error: None,
             handling_error: false,
             resume_at: None,
+            environ: std::env::vars().collect(),
         }
     }
 
@@ -474,6 +485,7 @@ impl Vm {
         self.on_error = None;
         self.handling_error = false;
         self.resume_at = None;
+        // `memory` and `environ` stay. RUN must not wipe PEEK or ENVIRON.
     }
 
     fn clear_vars(&mut self) {
@@ -1050,6 +1062,11 @@ fn walk(
         "MKDIR" => exec_dir(parser, mode, ctx.as_mut(), DirOp::Mkdir),
         "RMDIR" => exec_dir(parser, mode, ctx.as_mut(), DirOp::Rmdir),
         "SHELL" => exec_shell(parser, mode, ctx.as_mut()),
+        "RENUM" => exec_renum(parser, mode, ctx.as_mut()),
+        "LSET" => exec_justify(parser, mode, ctx.as_mut(), true),
+        "RSET" => exec_justify(parser, mode, ctx.as_mut(), false),
+        "ENVIRON" => exec_environ(parser, mode, ctx.as_mut()),
+        "RESET" => exec_reset(parser, mode, ctx.as_mut()),
         "POKE" => exec_poke(parser, mode, ctx.as_mut()),
         "BSAVE" => exec_bsave(parser, mode, ctx.as_mut()),
         "BLOAD" => exec_bload(parser, mode, ctx.as_mut()),
@@ -1517,6 +1534,12 @@ fn func_of(name: &str) -> Option<Func> {
         "EOF" => Func::Eof,
         "LOF" => Func::Lof,
         "LOC" => Func::Loc,
+        "MKI$" => Func::Mki,
+        "MKS$" => Func::Mks,
+        "MKD$" => Func::Mkd,
+        "CVI" => Func::Cvi,
+        "CVS" => Func::Cvs,
+        "CVD" => Func::Cvd,
         _ => return None,
     })
 }
@@ -1601,6 +1624,14 @@ fn parse_primary(parser: &mut Parser<'_>) -> Result<Expr, RunErr> {
             }
             if name == "RND" && !matches!(parser.cur, Tok::Punct(b'(')) {
                 return Ok(Expr::Call(Func::Rnd, Vec::new()));
+            }
+            if name == "ENVIRON" && matches!(parser.cur, Tok::Punct(b'$')) {
+                parser.bump();
+                let args = arg_list(parser)?;
+                if args.len() != 1 {
+                    return Err(fault(SYNTAX, 2));
+                }
+                return Ok(Expr::Call(Func::Environ, args));
             }
             if let Some(func) = func_of(name) {
                 let args = arg_list(parser)?;
@@ -2209,6 +2240,51 @@ fn eval_call(vm: &mut Vm, host: &mut Host<'_>, func: Func, args: &[Expr]) -> Res
         Func::Loc => {
             let n = cint_value(&values[0])?;
             Ok(value_from_i32(host.files.loc(n).map_err(file_fault)?))
+        }
+        Func::Mki => {
+            let n = cint_value(&values[0])?;
+            Ok(Value::Str(bytes_string(&n.to_le_bytes())))
+        }
+        Func::Mks => {
+            let m = to_mbf(value_num(&values[0])?, false)?;
+            Ok(Value::Str(bytes_string(&m.to_le_single())))
+        }
+        Func::Mkd => {
+            let m = to_mbf(value_num(&values[0])?, true)?;
+            Ok(Value::Str(bytes_string(&m.to_le_double())))
+        }
+        Func::Cvi => {
+            let bytes = string_bytes(&values[0])?;
+            if bytes.len() < 2 {
+                return Err(fault(ILLEGAL, 5));
+            }
+            Ok(Value::Int(i16::from_le_bytes([bytes[0], bytes[1]])))
+        }
+        Func::Cvs => {
+            let bytes = string_bytes(&values[0])?;
+            if bytes.len() < 4 {
+                return Err(fault(ILLEGAL, 5));
+            }
+            let mut raw = [0u8; 4];
+            raw.copy_from_slice(&bytes[..4]);
+            Ok(Value::Single(Mbf::from_le_single(raw)))
+        }
+        Func::Cvd => {
+            let bytes = string_bytes(&values[0])?;
+            if bytes.len() < 8 {
+                return Err(fault(ILLEGAL, 5));
+            }
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(&bytes[..8]);
+            Ok(Value::Double(Mbf::from_le_double(raw)))
+        }
+        Func::Environ => {
+            let name = need_str(&values[0])?;
+            let value = environ_get(vm, &name);
+            if value.chars().count() > 255 {
+                return Err(fault(STRING_LONG, 15));
+            }
+            Ok(Value::Str(value))
         }
         Func::Unsupported => Err(fault(ILLEGAL, 5)),
     }
@@ -2924,6 +3000,13 @@ fn exec_if(
     if mode == Mode::Check {
         if is_line_ref(&parser.cur) {
             let _ = parse_line_ref(parser)?;
+            // `ELSE` is stored as colon + ELSE. That colon is not a statement break.
+            if matches!(parser.cur, Tok::Colon) {
+                let look = Parser::new(parser.toks, parser.i);
+                if look.cur.is("ELSE") {
+                    parser.bump();
+                }
+            }
         } else {
             walk_checked_until_else(parser)?;
         }
@@ -4579,7 +4662,7 @@ fn exec_shell(
     } else {
         String::new()
     };
-    let text = files::run_shell(&command).map_err(file_fault)?;
+    let text = files::run_shell(&command, &ctx.0.environ).map_err(file_fault)?;
     if !text.is_empty() {
         emit(ctx.1, &text);
         if !text.ends_with('\n') {
@@ -4821,4 +4904,244 @@ fn skip_resumed(program: &Program, direct: &[u8], ip: Ip) -> Result<Ip, RunErr> 
         line: ip.line,
         offset: here(&parser),
     })
+}
+
+fn string_bytes(v: &Value) -> Result<Vec<u8>, RunErr> {
+    let text = need_str(v)?;
+    let mut bytes = Vec::with_capacity(text.len());
+    for ch in text.chars() {
+        let code = u32::from(ch);
+        if code > 255 {
+            return Err(fault(ILLEGAL, 5));
+        }
+        bytes.push(code as u8);
+    }
+    Ok(bytes)
+}
+
+fn environ_get(vm: &Vm, name: &str) -> String {
+    vm.environ
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default()
+}
+
+fn environ_assign(vm: &mut Vm, text: &str) -> Result<(), RunErr> {
+    let Some(eq) = text.find('=') else {
+        return Err(fault(ILLEGAL, 5));
+    };
+    let name = &text[..eq];
+    let value = &text[eq + 1..];
+    if name.is_empty() {
+        return Err(fault(ILLEGAL, 5));
+    }
+    if value.is_empty() {
+        vm.environ
+            .retain(|(key, _)| !key.eq_ignore_ascii_case(name));
+        return Ok(());
+    }
+    if let Some((_, slot)) = vm
+        .environ
+        .iter_mut()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+    {
+        *slot = value.to_string();
+    } else {
+        vm.environ.push((name.to_string(), value.to_string()));
+    }
+    Ok(())
+}
+
+fn exec_environ(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let expr = parse_expr(parser)?;
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let text = eval_string(ctx.0, ctx.1, &expr)?;
+    environ_assign(ctx.0, &text)?;
+    Ok(Flow::Next)
+}
+
+fn exec_reset(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    ctx.1.files.close_all();
+    Ok(Flow::Next)
+}
+
+fn exec_justify(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+    left: bool,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let dest = parse_target(parser)?;
+    expect_word(parser, "=")?;
+    let expr = parse_expr(parser)?;
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let value = eval_string(ctx.0, ctx.1, &expr)?;
+    let current = need_str(&load_target(ctx.0, ctx.1, &dest)?)?;
+    store_target(
+        ctx.0,
+        ctx.1,
+        &dest,
+        Value::Str(justify(&current, &value, left)),
+    )?;
+    Ok(Flow::Next)
+}
+
+fn justify(current: &str, value: &str, left: bool) -> String {
+    let width = current.chars().count();
+    let chars: Vec<char> = value.chars().take(width).collect();
+    if chars.len() >= width {
+        return chars.into_iter().collect();
+    }
+    let pad = width - chars.len();
+    let mut out = String::new();
+    if left {
+        out.extend(chars);
+        out.extend(std::iter::repeat_n(' ', pad));
+    } else {
+        out.extend(std::iter::repeat_n(' ', pad));
+        out.extend(chars);
+    }
+    out
+}
+
+fn optional_renum_number(parser: &mut Parser<'_>) -> Result<Option<u32>, RunErr> {
+    if terminated(&parser.cur) || matches!(parser.cur, Tok::Punct(b',')) {
+        return Ok(None);
+    }
+    let n = match &parser.cur {
+        Tok::Int(n) => {
+            if *n < 0 {
+                return Err(fault(ILLEGAL, 5));
+            }
+            u32::from(*n as u16)
+        }
+        Tok::Hex(n) | Tok::Oct(n) | Tok::Line(n) => u32::from(*n),
+        Tok::Single(m) | Tok::Double(m) => whole_line_number(*m)?,
+        _ => return Err(fault(SYNTAX, 2)),
+    };
+    parser.bump();
+    if n > 65529 {
+        return Err(fault(ILLEGAL, 5));
+    }
+    Ok(Some(n))
+}
+
+fn whole_line_number(m: Mbf) -> Result<u32, RunErr> {
+    let f = m.to_f64();
+    if !(0.0..=65529.0).contains(&f) || f.fract() != 0.0 {
+        return Err(fault(ILLEGAL, 5));
+    }
+    Ok(f as u32)
+}
+
+fn exec_renum(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let new_start = optional_renum_number(parser)?.unwrap_or(10);
+    let mut old = None;
+    let mut increment = 10u32;
+    if matches!(parser.cur, Tok::Punct(b',')) {
+        parser.bump();
+        old = optional_renum_number(parser)?;
+        if matches!(parser.cur, Tok::Punct(b',')) {
+            parser.bump();
+            if let Some(n) = optional_renum_number(parser)? {
+                increment = n;
+            }
+        }
+    }
+    if !terminated(&parser.cur) {
+        return Err(fault(SYNTAX, 2));
+    }
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    if ctx.0.current_line.is_some() || ctx.1.program.is_protected() {
+        return Err(fault(ILLEGAL, 5));
+    }
+    if increment == 0 {
+        return Err(fault(ILLEGAL, 5));
+    }
+    if ctx.1.program.is_empty() {
+        return Ok(Flow::Next);
+    }
+    let numbers: Vec<u16> = ctx.1.program.iter_code().map(|(n, _)| n).collect();
+    let start_at = if let Some(old) = old {
+        let old = u16::try_from(old).map_err(|_| fault(ILLEGAL, 5))?;
+        numbers
+            .iter()
+            .position(|&n| n == old)
+            .ok_or_else(|| fault(UNDEF_LINE, 8))?
+    } else {
+        0
+    };
+    if start_at > 0 && new_start <= u32::from(numbers[start_at - 1]) {
+        return Err(fault(ILLEGAL, 5));
+    }
+    let moving = &numbers[start_at..];
+    let mut next = new_start;
+    let mut map = BTreeMap::new();
+    for (index, &number) in moving.iter().enumerate() {
+        if next > 65529 {
+            return Err(fault(ILLEGAL, 5));
+        }
+        let new_number = u16::try_from(next).map_err(|_| fault(ILLEGAL, 5))?;
+        map.insert(number, new_number);
+        if index + 1 == moving.len() {
+            break;
+        }
+        next = next
+            .checked_add(increment)
+            .ok_or_else(|| fault(ILLEGAL, 5))?;
+    }
+    let present: BTreeSet<u16> = numbers.iter().copied().collect();
+    let mut rebuilt = Vec::new();
+    let mut notes = Vec::new();
+    for (number, code) in ctx.1.program.iter_code() {
+        let (tokens, missing) = crunch::retarget_lines(code, &map, &present);
+        let new_number = map.get(&number).copied().unwrap_or(number);
+        for miss in missing {
+            notes.push(format!("Undefined line {miss} in {new_number}"));
+        }
+        let listed = crunch::list_tokens(&tokens);
+        let text = if listed.is_empty() {
+            new_number.to_string()
+        } else {
+            format!("{new_number} {listed}")
+        };
+        rebuilt.push((new_number, tokens, text));
+    }
+    ctx.1.program.rewrite(rebuilt, &map);
+    ctx.0.invalidate_cont();
+    for note in notes {
+        emit(ctx.1, &note);
+        emit(ctx.1, "\n");
+    }
+    Ok(Flow::Next)
 }

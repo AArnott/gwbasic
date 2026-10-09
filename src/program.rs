@@ -108,4 +108,16 @@ impl Program {
     pub fn stored_bytes(&self) -> usize {
         self.lines.values().map(|line| line.tokens.len() + 4).sum()
     }
+
+    /// Replace every line. Does not clear the protected flag. `last` moves
+    /// when that line number was one of the renumbered lines.
+    pub fn rewrite(&mut self, lines: Vec<(u16, Vec<u8>, String)>, renamed: &BTreeMap<u16, u16>) {
+        self.lines.clear();
+        for (number, tokens, text) in lines {
+            self.lines.insert(number, Line { tokens, text });
+        }
+        if let Some(new_number) = self.last.and_then(|last| renamed.get(&last).copied()) {
+            self.last = Some(new_number);
+        }
+    }
 }

@@ -4,7 +4,7 @@ A GW-BASIC 3.23 environment in Rust: the screen editor, the F1–F10 soft keys, 
 
 The window is the GW-BASIC screen (80×25, an 8×16 font, integer-scaled). It is a winit window with a softbuffer, so the same program runs on Windows, Linux, and macOS. The host console is not the screen. Tones use `kernel32` `Beep` on Windows, `osascript beep` on macOS, and `paplay` on Linux. If the player is missing, the statement still succeeds.
 
-What runs: the editor, the text language (`PRINT` through `WHILE`/`WEND`, types, `INPUT`, `DATA`), `SAVE`/`LOAD`/`MERGE`/`CHAIN` in ASCII, tokenized, and protected form, sequential files, `PEEK`/`POKE` on one 64K segment, `SOUND`, `ON ERROR`, and `SHELL`. Still `Illegal function call`: graphics, `PLAY`, random `FIELD`/`GET`/`PUT`, `CALL`/`USR`, serial, cassette, joystick, and light pen.
+What runs: the editor, the text language (`PRINT` through `WHILE`/`WEND`, types, `INPUT`, `DATA`), `SAVE`/`LOAD`/`MERGE`/`CHAIN` in ASCII, tokenized, and protected form, sequential files, `PEEK`/`POKE` on one 64K segment, `SOUND`, `ON ERROR`, `SHELL`, `RENUM`, `LSET`/`RSET`, `ENVIRON`, the `MKx$`/`CVx` conversions, and `RESET`. Still `Illegal function call`: graphics, `PLAY`, random `FIELD`/`GET`/`PUT`, `CALL`/`USR`, serial, cassette, joystick, and light pen.
 
 ## Build and run
 
