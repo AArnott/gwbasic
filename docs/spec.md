@@ -42,6 +42,8 @@ The editor and the text-mode interpreter:
 - `MKI$`/`CVI`, `MKS$`/`CVS`, and `MKD$`/`CVD` convert between numbers and the 2-, 4-, and 8-byte forms (integer, single MBF, double MBF). A string shorter than that width is `Illegal function call`. Extra bytes are ignored.
 - `ENVIRON "name=value"` sets a variable in the interpreter's copy of the environment. `ENVIRON "name="` removes it. The name match ignores case. `ENVIRON$` reads it back. This does not change the process environment. `RUN` and `CLEAR` do not clear it.
 - `RESET` closes every open file.
+- `COMMON name` and `COMMON name()` name the scalars and arrays that the next `CHAIN` keeps. A scalar and an array of the same name are separate. The names are recorded when `COMMON` runs. `CHAIN` then clears every other variable, array, `DEF FN`, and type default. `LOAD` does not keep them.
+- `INPUT$(n)` and `INPUT$(n,#file)` read `n` characters, with `n` from 1 to 255. From a file, those characters are raw bytes, including CR and LF. If fewer bytes remain, the result is `Input past end` and the file position stays put. From the keyboard, `INPUT$` does not echo. It waits until that many keys are waiting, then the statement runs again. Ctrl+Break and Ctrl+C during the wait stop the program the way they do at `INPUT`.
 
 Still `Illegal function call` at run time, after they tokenize: graphics (`SCREEN` other than 0, `PSET`, `PRESET`, `LINE`, `CIRCLE`, `PAINT`, `DRAW`), `PLAY`, random files (`FIELD`, `GET`, `PUT`), `CALL`/`USR`, and device statements such as `OUT` and `WAIT`. Serial, cassette, joystick, and light pen stay out.
 

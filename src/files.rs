@@ -187,6 +187,27 @@ impl Files {
         Ok(out.into_iter().map(char::from).collect())
     }
 
+    /// Read `count` raw bytes. CR and LF count. Short files are `Input past end`
+    /// and the position does not move.
+    pub fn read_chars(&mut self, number: i16, count: usize) -> Result<String, &'static str> {
+        let number = self.slot(number)?;
+        let channel = self.channels[number].as_mut().ok_or(BAD_FILE_MODE)?;
+        if channel.mode != SeqMode::Input {
+            return Err(BAD_FILE_MODE);
+        }
+        let end = channel.pos.saturating_add(count);
+        if count == 0 || end > channel.data.len() {
+            return Err(INPUT_PAST_END);
+        }
+        let text: String = channel.data[channel.pos..end]
+            .iter()
+            .copied()
+            .map(char::from)
+            .collect();
+        channel.pos = end;
+        Ok(text)
+    }
+
     pub fn read_line(&mut self, number: i16) -> Result<String, &'static str> {
         let number = self.slot(number)?;
         let channel = self.channels[number].as_mut().ok_or(BAD_FILE_MODE)?;

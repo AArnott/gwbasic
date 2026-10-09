@@ -120,6 +120,10 @@ impl Session {
             self.paused = false;
             return;
         }
+        if self.vm.waiting_keys() {
+            self.handle_key_wait(input);
+            return;
+        }
         if self.vm.is_running() {
             self.handle_running(input);
             return;
@@ -232,10 +236,29 @@ impl Session {
 
     /// Run a short slice of a program that did not finish inside `Enter`.
     pub fn poll(&mut self) {
+        if self.vm.waiting_keys() {
+            if self.inkey.len() < self.vm.keys_needed() {
+                return;
+            }
+            self.vm.resume_keys();
+        }
         if self.vm.is_running() {
             let status = self.burst(4_000);
             let _ = self.apply_status(status);
         }
+    }
+
+    fn handle_key_wait(&mut self, input: Input) {
+        match input {
+            Input::Break | Input::CtrlC => self.on_break(),
+            Input::Char(ch) => self.inkey.push_back(ch),
+            Input::Enter => self.inkey.push_back(b'\r'),
+            Input::Function(n) if (1..=10).contains(&n) => {
+                self.inkey.extend(self.keys.get(n).iter().copied());
+            }
+            _ => return,
+        }
+        self.poll();
     }
 
     fn move_arrow(&mut self, step: impl FnOnce(&mut Screen)) {
@@ -292,7 +315,7 @@ impl Session {
     }
 
     fn on_break(&mut self) {
-        if self.vm.is_running() || self.vm.waiting_input() {
+        if self.vm.is_running() || self.vm.waiting_input() || self.vm.waiting_keys() {
             let line = self.vm.break_line();
             self.vm.request_break();
             self.auto = None;
@@ -1773,6 +1796,66 @@ mod tests {
         reset.type_ascii(&format!("OPEN \"{}\" FOR OUTPUT AS #1\n", path.display()));
         reset.type_ascii("RESET\nPRINT EOF(1)\n");
         assert!(reset.snapshot().contains("Bad file mode"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn common_survives_chain_and_input_dollar_reads() {
+        let dir = std::env::temp_dir().join("gwbasic-milestone5");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let chained = dir.join("NEXT.BAS");
+        std::fs::write(&chained, "10 PRINT A;B\n20 PRINT A(1)\n").unwrap();
+        let chained_lit = chained.display().to_string();
+
+        let mut session = fresh();
+        session.type_ascii(&format!(
+            "10 COMMON A,A()\n20 A=4\n30 B=9\n40 DIM A(2)\n50 A(1)=7\n60 CHAIN \"{chained_lit}\"\nRUN\n"
+        ));
+        let snap = session.snapshot();
+        assert!(snap.lines().any(|line| line == " 4  0"), "{snap}");
+        assert!(snap.lines().any(|line| line == " 7"), "{snap}");
+
+        let cleared = dir.join("ZERO.BAS");
+        std::fs::write(&cleared, "10 PRINT A\n").unwrap();
+        let mut lost = fresh();
+        lost.type_ascii(&format!(
+            "10 A=4\n20 CHAIN \"{}\"\nRUN\n",
+            cleared.display()
+        ));
+        assert!(
+            lost.snapshot().lines().any(|line| line == " 0"),
+            "{}",
+            lost.snapshot()
+        );
+
+        let note = dir.join("note.txt");
+        let mut typed = fresh();
+        typed.type_ascii(&format!(
+            "OPEN \"{}\" FOR OUTPUT AS #1\nPRINT #1, \"Ab\";\nCLOSE #1\n",
+            note.display()
+        ));
+        typed.type_ascii(&format!(
+            "OPEN \"{}\" FOR INPUT AS #1\nPRINT INPUT$(2,#1)\n",
+            note.display()
+        ));
+        assert!(typed.snapshot().lines().any(|line| line == "Ab"));
+        typed.type_ascii("PRINT INPUT$(1,#1)\n");
+        assert!(typed.snapshot().contains("Input past end"));
+
+        let mut keys = fresh();
+        keys.type_ascii("10 PRINT INPUT$(1);INPUT$(1)\nRUN\nAB");
+        let snap = keys.snapshot();
+        assert_eq!(
+            snap.lines().filter(|line| *line == "AB").count(),
+            1,
+            "{snap}"
+        );
+
+        let mut bad = fresh();
+        bad.type_ascii("PRINT INPUT$(0)\n");
+        assert!(bad.snapshot().contains(ILLEGAL));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

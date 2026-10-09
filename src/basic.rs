@@ -28,6 +28,7 @@ const DUPLICATE: &str = "Duplicate Definition";
 const OUT_OF_MEMORY: &str = "Out of memory";
 const RESUME_WITHOUT: &str = "RESUME without error";
 const UNPRINTABLE: &str = "Unprintable error";
+const KEY_WAIT: i16 = -1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Ty {
     Int,
@@ -208,6 +209,7 @@ enum Func {
     Cvs,
     Cvd,
     Environ,
+    InputFn,
     /// A tokenized function this milestone does not implement (`VARPTR`, `INP`, …).
     Unsupported,
 }
@@ -259,9 +261,20 @@ struct Pending {
     prompt: String,
 }
 
+#[derive(Clone)]
 struct Array {
     dims: Vec<(i16, i16)>,
     data: Vec<Value>,
+}
+
+struct CommonItem {
+    name: Name,
+    array: bool,
+}
+
+struct CommonKeep {
+    scalars: Vec<(Name, Value)>,
+    arrays: Vec<(Name, Array)>,
 }
 
 #[derive(Clone)]
@@ -294,6 +307,8 @@ enum Phase {
     Idle,
     Run,
     Input,
+    /// `INPUT$` is waiting for keyboard bytes. The window waits; it does not poll.
+    KeyWait,
 }
 
 enum Flow {
@@ -349,6 +364,10 @@ pub struct Vm {
     /// Process environment captured at startup. `ENVIRON` edits this copy.
     /// `SHELL` passes it to the child. `RUN` and `CLEAR` do not reset it.
     environ: Vec<(String, String)>,
+    /// Names `COMMON` will keep across the next `CHAIN`.
+    common: Vec<CommonItem>,
+    /// Characters `INPUT$` still needs from the keyboard.
+    wait_keys: Option<u16>,
 }
 
 pub struct Host<'a> {
@@ -419,6 +438,23 @@ impl Vm {
             handling_error: false,
             resume_at: None,
             environ: std::env::vars().collect(),
+            common: Vec::new(),
+            wait_keys: None,
+        }
+    }
+
+    pub fn waiting_keys(&self) -> bool {
+        self.phase == Phase::KeyWait
+    }
+
+    pub fn keys_needed(&self) -> usize {
+        usize::from(self.wait_keys.unwrap_or(0))
+    }
+
+    pub fn resume_keys(&mut self) {
+        if self.phase == Phase::KeyWait {
+            self.phase = Phase::Run;
+            self.wait_keys = None;
         }
     }
 
@@ -447,9 +483,10 @@ impl Vm {
     }
 
     pub fn request_break(&mut self) {
-        if self.phase == Phase::Run || self.phase == Phase::Input {
+        if self.phase == Phase::Run || self.phase == Phase::Input || self.phase == Phase::KeyWait {
             self.phase = Phase::Idle;
             self.pending = None;
+            self.wait_keys = None;
             // The caller prints Break. Continuation is the statement that was next.
             self.cont = Some(self.ip);
         }
@@ -459,6 +496,7 @@ impl Vm {
     pub fn abandon(&mut self) {
         self.phase = Phase::Idle;
         self.pending = None;
+        self.wait_keys = None;
         self.cont = None;
     }
 
@@ -485,6 +523,8 @@ impl Vm {
         self.on_error = None;
         self.handling_error = false;
         self.resume_at = None;
+        self.common.clear();
+        self.wait_keys = None;
         // `memory` and `environ` stay. RUN must not wipe PEEK or ENVIRON.
     }
 
@@ -681,6 +721,10 @@ pub fn burst(vm: &mut Vm, host: &mut Host<'_>, mut budget: u32) -> Status {
         }
         let flow = match walk(&mut parser, Mode::Run, Some((vm, host))) {
             Ok(flow) => flow,
+            Err(err) if err.code == KEY_WAIT => {
+                vm.phase = Phase::KeyWait;
+                return Status::Yield;
+            }
             Err(err) => {
                 let line = vm.current_line;
                 vm.err = err.code;
@@ -1067,6 +1111,7 @@ fn walk(
         "RSET" => exec_justify(parser, mode, ctx.as_mut(), false),
         "ENVIRON" => exec_environ(parser, mode, ctx.as_mut()),
         "RESET" => exec_reset(parser, mode, ctx.as_mut()),
+        "COMMON" => exec_common(parser, mode, ctx.as_mut()),
         "POKE" => exec_poke(parser, mode, ctx.as_mut()),
         "BSAVE" => exec_bsave(parser, mode, ctx.as_mut()),
         "BLOAD" => exec_bload(parser, mode, ctx.as_mut()),
@@ -1632,6 +1677,10 @@ fn parse_primary(parser: &mut Parser<'_>) -> Result<Expr, RunErr> {
                     return Err(fault(SYNTAX, 2));
                 }
                 return Ok(Expr::Call(Func::Environ, args));
+            }
+            if name == "INPUT" && matches!(parser.cur, Tok::Punct(b'$')) {
+                parser.bump();
+                return parse_input_fn(parser);
             }
             if let Some(func) = func_of(name) {
                 let args = arg_list(parser)?;
@@ -2286,6 +2335,7 @@ fn eval_call(vm: &mut Vm, host: &mut Host<'_>, func: Func, args: &[Expr]) -> Res
             }
             Ok(Value::Str(value))
         }
+        Func::InputFn => eval_input_fn(vm, host, &values),
         Func::Unsupported => Err(fault(ILLEGAL, 5)),
     }
 }
@@ -4505,6 +4555,11 @@ fn exec_load(
     let path = files::bas_path(&name).map_err(file_fault)?;
     let bytes = files::read_bytes(&path).map_err(file_fault)?;
     load_bytes(ctx.1.program, &bytes).map_err(file_fault)?;
+    let saved = if chain {
+        Some(snapshot_common(ctx.0))
+    } else {
+        None
+    };
     let start = match start {
         Some(dest) => match dest {
             LineRef::Num(n) => Some(n),
@@ -4513,7 +4568,11 @@ fn exec_load(
         None => None,
     };
     if run {
-        if begin_program(ctx.0, ctx.1.program, start) {
+        let started = begin_program(ctx.0, ctx.1.program, start);
+        if let Some(saved) = saved {
+            restore_common(ctx.0, saved);
+        }
+        if started {
             return Ok(Flow::Jump(ctx.0.ip));
         }
     } else {
@@ -5144,4 +5203,110 @@ fn exec_renum(
         emit(ctx.1, "\n");
     }
     Ok(Flow::Next)
+}
+
+fn parse_input_fn(parser: &mut Parser<'_>) -> Result<Expr, RunErr> {
+    expect_punct(parser, b'(')?;
+    let count = parse_expr(parser)?;
+    let mut args = vec![count];
+    if matches!(parser.cur, Tok::Punct(b',')) {
+        parser.bump();
+        args.push(file_number(parser)?);
+    }
+    expect_punct(parser, b')')?;
+    Ok(Expr::Call(Func::InputFn, args))
+}
+
+fn eval_input_fn(vm: &mut Vm, host: &mut Host<'_>, values: &[Value]) -> Result<Value, RunErr> {
+    let n = cint_value(&values[0])?;
+    if !(1..=255).contains(&n) {
+        return Err(fault(ILLEGAL, 5));
+    }
+    let count = usize::from(n as u16);
+    if values.len() == 2 {
+        let file = cint_value(&values[1])?;
+        let text = host.files.read_chars(file, count).map_err(file_fault)?;
+        return Ok(Value::Str(text));
+    }
+    if host.inkey.len() < count {
+        vm.wait_keys = Some(n as u16);
+        return Err(fault("", KEY_WAIT));
+    }
+    let mut text = String::new();
+    for _ in 0..count {
+        let byte = host.inkey.pop_front().unwrap_or(0);
+        text.push(char::from(byte));
+    }
+    Ok(Value::Str(text))
+}
+
+fn exec_common(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    if terminated(&parser.cur) {
+        return Err(fault(SYNTAX, 2));
+    }
+    let mut items = Vec::new();
+    loop {
+        let ident = take_ident(parser)?;
+        let array = if matches!(parser.cur, Tok::Punct(b'(')) {
+            parser.bump();
+            expect_punct(parser, b')')?;
+            true
+        } else {
+            false
+        };
+        items.push((ident, array));
+        if matches!(parser.cur, Tok::Punct(b',')) {
+            parser.bump();
+            if terminated(&parser.cur) {
+                return Err(fault(SYNTAX, 2));
+            }
+            continue;
+        }
+        break;
+    }
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    for (ident, array) in items {
+        let name = ident.resolve(&ctx.0.defs);
+        let seen = ctx
+            .0
+            .common
+            .iter()
+            .any(|item| item.name == name && item.array == array);
+        if !seen {
+            ctx.0.common.push(CommonItem { name, array });
+        }
+    }
+    Ok(Flow::Next)
+}
+
+fn snapshot_common(vm: &Vm) -> CommonKeep {
+    let mut scalars = Vec::new();
+    let mut arrays = Vec::new();
+    for item in &vm.common {
+        if item.array {
+            if let Some(array) = vm.arrays.get(&item.name) {
+                arrays.push((item.name.clone(), array.clone()));
+            }
+        } else if let Some(value) = vm.scalars.get(&item.name) {
+            scalars.push((item.name.clone(), value.clone()));
+        }
+    }
+    CommonKeep { scalars, arrays }
+}
+
+fn restore_common(vm: &mut Vm, saved: CommonKeep) {
+    for (name, value) in saved.scalars {
+        vm.scalars.insert(name, value);
+    }
+    for (name, array) in saved.arrays {
+        vm.arrays.insert(name, array);
+    }
 }
