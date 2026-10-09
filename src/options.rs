@@ -56,13 +56,13 @@ pub fn usage() -> &'static str {
     "\
 gwbasic [filename] [/F:n] [/I] [/S:n] [/C:n] [/M:n[,block]] [/D]
 
-  filename   ASCII program to load (.BAS assumed if omitted)
-  /F:n       maximum open files (default 3)
-  /I         allocate file buffers up front
-  /S:n       maximum random-file record length (default 128)
+  filename   program to load (.BAS assumed if omitted). ASCII, tokenized, or protected
+  /F:n       maximum open files (default 3, capped at 15)
+  /I         accepted; the file table is sized by /F either way
+  /S:n       random-file record length (default 128; random files are not implemented)
   /C:n       communications receive buffer (accepted, serial I/O is not wired up)
   /M:n[,m]   workspace size in bytes, capped at 65536, and reserved block size
-  /D         request double-precision transcendentals (honored when those functions exist)"
+  /D         SIN, COS, TAN, ATN, LOG, EXP, and SQR return doubles"
 }
 
 fn strip_switch(arg: &str) -> Option<&str> {

@@ -91,8 +91,8 @@ impl Mbf {
         }
         let frac = wide.sig & ((1u64 << 55) - 1);
         let mut out = [0u8; 8];
-        for i in 0..7 {
-            out[i] = (frac >> (8 * i)) as u8;
+        for (i, slot) in out.iter_mut().enumerate().take(7) {
+            *slot = (frac >> (8 * i)) as u8;
         }
         if wide.neg {
             out[6] |= 0x80;
@@ -120,8 +120,8 @@ impl Mbf {
             return Self::zero(true);
         }
         let mut frac = 0u64;
-        for i in 0..7 {
-            frac |= u64::from(bytes[i]) << (8 * i);
+        for (i, byte) in bytes.iter().enumerate().take(7) {
+            frac |= u64::from(*byte) << (8 * i);
         }
         frac &= (1u64 << 55) - 1;
         Self {
@@ -497,11 +497,9 @@ fn shift_right_round(mut n: u128, shift: u32) -> u128 {
         return 0;
     }
     let round = (n >> (shift - 1)) & 1 == 1;
-    let sticky = shift >= 2 && n & ((1u128 << (shift - 1)) - 1) != 0;
     n >>= shift;
-    if round && (sticky || n & 1 == 1) {
-        n += 1;
-    } else if round && !sticky {
+    // A set round bit always rounds away from zero.
+    if round {
         n += 1;
     }
     n

@@ -1,20 +1,26 @@
 # gwbasic
 
-A GW-BASIC 3.23 environment in Rust: the screen editor, the F1–F10 soft keys, and a text-mode interpreter. Graphics, files, and tokenized `SAVE`/`LOAD` come later. The rules are in [docs/spec.md](docs/spec.md).
+A GW-BASIC 3.23 environment in Rust: the screen editor, the F1–F10 soft keys, and a text-mode interpreter. The rules are in [docs/spec.md](docs/spec.md).
 
-The window is the GW-BASIC screen (80×25, an 8×16 font, integer-scaled). The host console is not.
+The window is the GW-BASIC screen (80×25, an 8×16 font, integer-scaled). It is a winit window with a softbuffer, so the same program runs on Windows, Linux, and macOS. The host console is not the screen. Tones use `kernel32` `Beep` on Windows, `osascript beep` on macOS, and `paplay` on Linux. If the player is missing, the statement still succeeds.
+
+What runs: the editor, the text language (`PRINT` through `WHILE`/`WEND`, types, `INPUT`, `DATA`), `SAVE`/`LOAD`/`MERGE`/`CHAIN` in ASCII, tokenized, and protected form, sequential files, `PEEK`/`POKE` on one 64K segment, `SOUND`, `ON ERROR`, and `SHELL`. Still `Illegal function call`: graphics, `PLAY`, random `FIELD`/`GET`/`PUT`, `CALL`/`USR`, serial, cassette, joystick, and light pen.
 
 ## Build and run
 
 ```
 cargo run
 cargo test
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
 cargo run -- examples/hello.bas
 ```
 
-`cargo run -- examples/hello.bas` loads that ASCII program and prints the banner. `LIST` shows it. `RUN` executes it. At the `Ok` prompt, `PRINT "Hello"` prints `Hello` and then `Ok`.
+GitHub Actions runs those three checks on Ubuntu, macOS, and Windows. Ubuntu installs `pkg-config`, `libwayland-dev`, `libxkbcommon-dev`, and `libx11-dev` so winit can link.
 
-A filename with no extension is opened as `.BAS`. If the file is missing, or if it is a tokenized `FF`/`FE` program, the editor stays open and prints the error. Tokenized `LOAD`/`SAVE` is later.
+`cargo run -- examples/hello.bas` loads that ASCII program and prints the banner. `LIST` shows it. `RUN` executes it. At the `Ok` prompt, `PRINT "Hello"` prints `Hello` and then `Ok`. F3 types `LOAD"` and F4 types `SAVE"`.
+
+A filename with no extension is opened as `.BAS`. A missing file prints `File not found` and stays in the editor. A real tokenized (`FF`) or protected (`FE`) file loads. A corrupt one prints `Illegal function call`.
 
 Useful keys, once the window is up: F1 types `LIST`, F2 runs `RUN`, Esc erases the logical line, Ctrl+Break abandons it. `SYSTEM` closes the window.
 

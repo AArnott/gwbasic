@@ -79,7 +79,15 @@ pub fn crunch(source: &str) -> Result<Vec<u8>, Fault> {
     let mut line_mode = false;
     while i < src.len() {
         if src[i] == b' ' {
-            i += 1;
+            while src.get(i) == Some(&b' ') {
+                i += 1;
+            }
+            // Spaces inside a name are discarded (`MY VAR` is `MYVAR`).
+            // A space before AS / OUTPUT / APPEND / RANDOM is kept, because
+            // those words are not keywords and would otherwise merge (`OUTPUTAS`).
+            if keep_name_separator(&out, &src[i..]) {
+                out.push(b' ');
+            }
             continue;
         }
         if line_mode {
@@ -320,21 +328,14 @@ fn take_number(src: &[u8], i: &mut usize, out: &mut Vec<u8>, _line: bool) -> Res
     }
     let literal = std::str::from_utf8(&src[start..(*i - usize::from(suffix.is_some()))])
         .map_err(|_| Fault::syntax(at))?;
-    if suffix == Some(b'%') || (suffix.is_none() && !dot && exp_letter.is_none()) {
-        if let Ok(n) = literal.parse::<i32>() {
-            if (-32768..=32767).contains(&n) && suffix != Some(b'!') && suffix != Some(b'#') {
-                if suffix == Some(b'%') || (suffix.is_none() && !dot && exp_letter.is_none()) {
-                    if suffix != Some(b'!') && suffix != Some(b'#') && !dot && exp_letter.is_none()
-                    {
-                        emit_int(out, n as i16);
-                        return Ok(());
-                    }
-                }
-            } else if suffix == Some(b'%') {
-                return Err(Fault::overflow(at));
+    if !dot && exp_letter.is_none() && (suffix == Some(b'%') || suffix.is_none()) {
+        match literal.parse::<i32>() {
+            Ok(n) if (-32768..=32767).contains(&n) => {
+                emit_int(out, n as i16);
+                return Ok(());
             }
-        } else if suffix == Some(b'%') {
-            return Err(Fault::overflow(at));
+            _ if suffix == Some(b'%') => return Err(Fault::overflow(at)),
+            _ => {}
         }
     }
     let double = suffix == Some(b'#')
@@ -391,6 +392,9 @@ fn take_ident(src: &[u8], i: &mut usize, out: &mut Vec<u8>) {
 }
 
 pub fn next_tok(toks: &[u8], i: &mut usize) -> Tok {
+    while toks.get(*i) == Some(&b' ') {
+        *i += 1;
+    }
     if *i >= toks.len() || toks[*i] == 0 {
         return Tok::End;
     }
@@ -464,12 +468,12 @@ pub fn next_tok(toks: &[u8], i: &mut usize) -> Tok {
             *i += 9;
             Tok::Double(Mbf::from_le_double(bytes))
         }
-        0xFD | 0xFE | 0xFF => {
+        0xFD..=0xFF => {
             let code = toks.get(*i + 1).copied().unwrap_or(0);
             *i += 2;
             Tok::Word(keyword_name(b, code).unwrap_or("?"))
         }
-        0x80..=0xFE => {
+        0x80..=0xFC => {
             *i += 1;
             Tok::Word(keyword_name(0, b).unwrap_or("?"))
         }
@@ -490,7 +494,10 @@ pub fn next_tok(toks: &[u8], i: &mut usize) -> Tok {
             while *i < toks.len() && toks[*i].is_ascii_alphanumeric() {
                 *i += 1;
             }
-            if *i < toks.len() && matches!(toks[*i], b'%' | b'!' | b'#' | b'$') {
+            // `%` `!` `$` are only type suffixes. `#` is also the file-number
+            // mark in `AS #1`, so it stays punctuation and variable parsing
+            // absorbs it when a name is expected.
+            if *i < toks.len() && matches!(toks[*i], b'%' | b'!' | b'$') {
                 *i += 1;
             }
             let name = toks[start..*i].iter().map(|b| char::from(*b)).collect();
@@ -557,7 +564,7 @@ fn render(toks: &[Tok]) -> String {
             continue;
         }
         let piece = render_one(&toks[index]);
-        if space_before(&out, &toks[index]) {
+        if space_before(&out, &toks[index]) || space_before_file_mark(&out, &toks[index..]) {
             out.push(' ');
         }
         out.push_str(&piece);
@@ -596,14 +603,68 @@ fn latin1(bytes: &[u8]) -> String {
     bytes.iter().copied().map(char::from).collect()
 }
 
+fn space_before_file_mark(out: &str, toks: &[Tok]) -> bool {
+    if out.is_empty() || out.ends_with(' ') || !ends_with_name(out) {
+        return false;
+    }
+    let Some(Tok::Punct(b'#')) = toks.first() else {
+        return false;
+    };
+    // `A# = 1` keeps the suffix glued. `AS #1` puts a space before the mark
+    // when a value follows it.
+    matches!(
+        toks.get(1),
+        Some(
+            Tok::Int(_)
+                | Tok::Hex(_)
+                | Tok::Oct(_)
+                | Tok::Single(_)
+                | Tok::Double(_)
+                | Tok::Ident(_)
+                | Tok::Line(_)
+                | Tok::Punct(b'(')
+        )
+    )
+}
+
+fn ends_with_name(out: &str) -> bool {
+    out.ends_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '$' | '%' | '!' | '#'))
+}
+
+/// `true` when `next` is a non-keyword word that must not stick to the name
+/// just written. `INPUT` is a real keyword, so it does not need this.
+fn keep_name_separator(out: &[u8], next: &[u8]) -> bool {
+    let Some(prev) = out.last().copied() else {
+        return false;
+    };
+    if !prev.is_ascii_alphanumeric() {
+        return false;
+    }
+    for word in ["OUTPUT", "APPEND", "RANDOM", "AS"] {
+        if starts_with_word(next, word) {
+            return true;
+        }
+    }
+    false
+}
+
+fn starts_with_word(src: &[u8], word: &str) -> bool {
+    let name = word.as_bytes();
+    if src.len() < name.len() || !src[..name.len()].eq_ignore_ascii_case(name) {
+        return false;
+    }
+    !src.get(name.len())
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+}
+
 fn space_before(out: &str, tok: &Tok) -> bool {
     if out.is_empty() || out.ends_with(' ') {
         return false;
     }
     match tok {
         Tok::Word(name) if tokens::is_word(name) && !matches!(*name, "REM" | "DATA") => true,
-        Tok::Ident(_)
-        | Tok::Int(_)
+        Tok::Ident(_) => out.ends_with(':') || ends_with_name(out),
+        Tok::Int(_)
         | Tok::Hex(_)
         | Tok::Oct(_)
         | Tok::Line(_)
@@ -655,6 +716,15 @@ mod tests {
             "PRINT \"Hello from GW-BASIC\""
         );
         assert_eq!(round_trip(" END"), "END");
+    }
+
+    #[test]
+    fn output_and_as_stay_separate_words() {
+        assert_eq!(
+            round_trip(r#"OPEN "F" FOR OUTPUT AS #1"#),
+            r#"OPEN "F" FOR OUTPUT AS #1"#
+        );
+        assert_eq!(round_trip("MY VAR=1"), "MYVAR=1");
     }
 
     #[test]

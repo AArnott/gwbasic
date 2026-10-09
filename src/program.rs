@@ -13,6 +13,7 @@ struct Line {
 pub struct Program {
     lines: BTreeMap<u16, Line>,
     pub last: Option<u16>,
+    protected: bool,
 }
 
 impl Program {
@@ -48,6 +49,26 @@ impl Program {
     pub fn clear(&mut self) {
         self.lines.clear();
         self.last = None;
+        self.protected = false;
+    }
+
+    pub fn is_protected(&self) -> bool {
+        self.protected
+    }
+
+    pub fn set_protected(&mut self, protected: bool) {
+        self.protected = protected;
+    }
+
+    pub fn line_pairs(&self) -> Vec<(u16, Vec<u8>)> {
+        self.lines
+            .iter()
+            .map(|(&n, line)| (n, line.tokens.clone()))
+            .collect()
+    }
+
+    pub fn listing(&self) -> Vec<String> {
+        self.lines.values().map(|line| line.text.clone()).collect()
     }
 
     pub fn is_empty(&self) -> bool {

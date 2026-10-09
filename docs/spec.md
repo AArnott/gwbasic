@@ -30,8 +30,17 @@ The editor and the text-mode interpreter:
 - `INPUT`, `LINE INPUT`, and `INKEY$`. `DATA`/`READ`/`RESTORE`.
 - A program line that fails to tokenize is not stored. The screen shows `^`, then `Syntax error` or `Overflow`, then `Ok`.
 - Ctrl+Break stops a running program (`Break` or `Break in n`, and `CONT` can resume). Ctrl+C does not. At the editor and at `INPUT`, Ctrl+C abandons the line the way Ctrl+Break does.
+- `SAVE`, `LOAD`, `MERGE`, and `CHAIN`. `SAVE "f"` writes a tokenized program (`FF`). `SAVE "f",A` writes ASCII (CRLF lines and a trailing `1A`). `SAVE "f",P` writes a protected program (`FE`, Stephen Kitt's cipher). `LOAD` reads all three. `LOAD "f",R` and `CHAIN` run the loaded program. `MERGE` accepts ASCII only. `CHAIN MERGE` is not implemented.
+- A protected program can `RUN`. It cannot be listed, edited, deleted, auto-numbered, or entered as a line. `SAVE` without `,P`, and `PEEK`, `POKE`, `BSAVE`, and `BLOAD`, are `Illegal function call` while it is protected.
+- Sequential files: `OPEN` (`FOR INPUT`/`OUTPUT`/`APPEND AS #n`, and `OPEN "O",#1,"file"`), `CLOSE`, `PRINT #`, `WRITE #`, `INPUT #`, `LINE INPUT #`, `EOF`, `LOF`, `LOC`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, and `RMDIR`. File numbers run from 1 to `min(/F, 15)`. The default is 3. Writes use CRLF. `EOF` is −1 at the end and 0 otherwise. `LOF` is the length. `LOC` is the position divided by 128.
+- `PEEK` and `POKE` on one 64K array. `DEF SEG` is remembered and written into the `BSAVE` header. Every segment number aliases that same array; this is not a map of video memory. `RUN` and `NEW` do not clear it. `BSAVE`/`BLOAD` use a 7-byte header (`FD`, segment, offset, length) and then the bytes.
+- `SOUND freq,duration`. `freq` is 37 to 32767 Hz. `duration` is in 18.2 Hz ticks. `BEEP` and `CHR$(7)` stay 800 Hz for 200 ms. The window thread plays the tone. `PLAY` is `Illegal function call`.
+- `ON ERROR GOTO`, `RESUME`, `RESUME NEXT`, `RESUME n`, and `ERROR n`. A second error inside the handler is reported normally. `RESUME` with no error trapped is `RESUME without error`.
+- `SHELL`. Windows runs `cmd /C`. Other hosts run `sh -c`. Empty `SHELL` does nothing. The command's output is printed on the BASIC screen.
 
-Still `Illegal function call` at run time, after they tokenize: graphics, sound, files, `PEEK`/`POKE`, `CALL`/`USR`, and the other statements named in the walker. Binary and protected `SAVE`/`LOAD` are not implemented. Serial, cassette, joystick, and light pen stay out. `SCREEN` with a mode other than 0 is `Illegal function call`.
+Still `Illegal function call` at run time, after they tokenize: graphics (`SCREEN` other than 0, `PSET`, `PRESET`, `LINE`, `CIRCLE`, `PAINT`, `DRAW`), `PLAY`, random files (`FIELD`, `GET`, `PUT`), `CALL`/`USR`, and device statements such as `OUT` and `WAIT`. Serial, cassette, joystick, and light pen stay out.
+
+The window is winit and softbuffer, so the editor is the same program on Windows, Linux, and macOS. The tone uses `kernel32` `Beep` on Windows, `osascript beep` on macOS, and `paplay` of the freedesktop bell on Linux. A missing player is ignored. The unit tests never open a window and never play a tone.
 
 ## Startup
 
@@ -50,9 +59,9 @@ Command line, from Guide section 2.3:
 gwbasic [filename] [/F:n] [/I] [/S:n] [/C:n] [/M:[n][,n]] [/D]
 ```
 
-Numbers may be decimal, `&H` hex, or `&O` octal. `/F` defaults to 3 and is ignored unless `/I` is also set (no file buffers exist yet; both flags are stored). `/S` defaults to 128. `/C` is accepted and ignored until serial I/O exists. A second filename is an error. `/F`, `/S`, `/C`, and `/D` are not honored beyond parsing until the features they size exist.
+Numbers may be decimal, `&H` hex, or `&O` octal. `/F` defaults to 3 and sizes the open-file table, capped at 15, whether or not `/I` is present. `/I` is accepted. `/S` defaults to 128 and is stored for random-file records, which are not implemented. `/C` is accepted and ignored until serial I/O exists. `/D` makes `SIN`, `COS`, `TAN`, `ATN`, `LOG`, `EXP`, and `SQR` return doubles. It does not change the banner. A second filename is an error.
 
-A filename with no extension gets `.BAS`. The file is loaded before the banner, so the free-space line includes it. A missing file stays in the editor and prints `File not found`. A file that starts with `FF` or `FE` is a tokenized or protected program; milestone 1 prints `Illegal function call` and does not load it. ASCII load skips a UTF-8 BOM and blank lines. Every other line must start with a line number.
+A filename with no extension gets `.BAS`. The file is loaded before the banner, so the free-space line includes it. A missing file stays in the editor and prints `File not found`. A file that starts with `FF` or `FE` is loaded as a tokenized or protected program. A truncated or otherwise illegal tokenized file prints `Illegal function call` and does not load. ASCII load skips a UTF-8 BOM and a trailing `1A`, and blank lines. Every other line must start with a line number.
 
 `SYSTEM` closes the window and does not print `Ok`.
 
@@ -153,7 +162,7 @@ The default attribute is `0x07` (light gray on black): low nibble foreground, hi
 
 ## Language rules
 
-The text rules below are what the interpreter runs. The on-disk tokenized format and the protected-file cipher are specified here and are not implemented yet.
+The text rules below are what the interpreter runs. Tokenized and protected programs use the on-disk format and the cipher in this section.
 
 Tokenization happens on Enter, not while typing. `LIST` will print keywords in uppercase. Quoted strings, and the text of `REM` and `DATA`, keep their case. `'` is stored as the token sequence for `:REM'`. `WHILE` is followed by a hidden byte that listings normally hide.
 

@@ -3,6 +3,7 @@
 //! and the result is rounded back into an MBF value.
 
 use crate::crunch::{self, Tok};
+use crate::files::{self, Files, SaveKind, SeqMode};
 use crate::mbf::{MathError, Mbf};
 use crate::program::Program;
 use crate::screen::Screen;
@@ -25,6 +26,8 @@ pub(crate) const REDO: &str = "Redo from start";
 const STRING_LONG: &str = "String too long";
 const DUPLICATE: &str = "Duplicate Definition";
 const OUT_OF_MEMORY: &str = "Out of memory";
+const RESUME_WITHOUT: &str = "RESUME without error";
+const UNPRINTABLE: &str = "Unprintable error";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Ty {
     Int,
@@ -194,7 +197,11 @@ enum Func {
     Cdbl,
     Fix,
     Pos,
-    /// A tokenized function this milestone does not implement (`PEEK`, `VARPTR`, …).
+    Peek,
+    Eof,
+    Lof,
+    Loc,
+    /// A tokenized function this milestone does not implement (`VARPTR`, `INP`, …).
     Unsupported,
 }
 
@@ -231,11 +238,6 @@ struct PrintItem {
 enum Target {
     Var(Ident),
     Index(Ident, Vec<Expr>),
-    Mid {
-        source: Expr,
-        start: Expr,
-        len: Option<Expr>,
-    },
 }
 
 #[derive(Clone, Debug)]
@@ -330,6 +332,13 @@ pub struct Vm {
     time_override: Option<String>,
     lpt_col: usize,
     current_line: Option<u16>,
+    /// One 64K data segment. `DEF SEG` is remembered for `BSAVE` and does not
+    /// map a second segment or hardware.
+    memory: Vec<u8>,
+    segment: u16,
+    on_error: Option<u16>,
+    handling_error: bool,
+    resume_at: Option<Ip>,
 }
 
 pub struct Host<'a> {
@@ -342,6 +351,8 @@ pub struct Host<'a> {
     pub key_offset: &'a mut usize,
     pub trace: &'a mut bool,
     pub quit: &'a mut bool,
+    pub files: &'a mut Files,
+    pub tone: &'a mut Option<(u32, u32)>,
 }
 
 pub enum Status {
@@ -392,6 +403,11 @@ impl Vm {
             time_override: None,
             lpt_col: 0,
             current_line: None,
+            memory: vec![0; 65536],
+            segment: 0,
+            on_error: None,
+            handling_error: false,
+            resume_at: None,
         }
     }
 
@@ -455,6 +471,9 @@ impl Vm {
         self.err = 0;
         self.erl = 0;
         self.lpt_col = 0;
+        self.on_error = None;
+        self.handling_error = false;
+        self.resume_at = None;
     }
 
     fn clear_vars(&mut self) {
@@ -498,6 +517,21 @@ impl<'a> Parser<'a> {
 }
 
 /// Crunch and reject a line that is not a legal statement list.
+pub fn store_source_line(
+    program: &mut Program,
+    number: u16,
+    rest: &str,
+) -> Result<(), crate::crunch::Fault> {
+    if rest.trim().is_empty() {
+        program.delete_line(number);
+        return Ok(());
+    }
+    let tokens = prepare(rest)?;
+    let listed = crunch::list_tokens(&tokens);
+    program.insert(number, tokens, format!("{number} {listed}"));
+    Ok(())
+}
+
 pub fn prepare(source: &str) -> Result<Vec<u8>, crate::crunch::Fault> {
     let tokens = crunch::crunch(source)?;
     if let Err(err) = check(&tokens) {
@@ -539,6 +573,10 @@ pub fn begin_direct(vm: &mut Vm, tokens: Vec<u8>) {
 pub fn begin_program(vm: &mut Vm, program: &Program, start: Option<u16>) -> bool {
     vm.reset_runtime();
     vm.data = collect_data(program);
+    if start.is_none() && program.is_empty() {
+        vm.phase = Phase::Idle;
+        return false;
+    }
     let line = program.first_from(start.unwrap_or(0));
     let Some(line) = line else {
         vm.phase = Phase::Idle;
@@ -635,9 +673,23 @@ pub fn burst(vm: &mut Vm, host: &mut Host<'_>, mut budget: u32) -> Status {
                 let line = vm.current_line;
                 vm.err = err.code;
                 vm.erl = i32::from(line.unwrap_or(0));
+                if let Some(handler) = vm.on_error.filter(|n| *n != 0) {
+                    if !vm.handling_error {
+                        vm.handling_error = true;
+                        vm.resume_at = Some(vm.ip);
+                        vm.ip = Ip {
+                            line: Some(handler),
+                            offset: 0,
+                        };
+                        vm.announce = true;
+                        vm.current_line = Some(handler);
+                        continue;
+                    }
+                }
                 vm.phase = Phase::Idle;
                 vm.cont = None;
                 vm.pending = None;
+                vm.handling_error = false;
                 return Status::Error {
                     message: err.message,
                     line,
@@ -831,9 +883,8 @@ fn walk(
     if parser.cur.is("MID$") {
         return assign_mid(parser, mode, ctx.as_mut());
     }
-    if let Tok::Ident(name) = &parser.cur {
-        let ident = Ident::parse(name);
-        parser.bump();
+    if matches!(parser.cur, Tok::Ident(_)) {
+        let ident = take_ident(parser)?;
         if matches!(parser.cur, Tok::Punct(b'(')) {
             let indexes = arg_list(parser)?;
             expect_word(parser, "=")?;
@@ -862,10 +913,24 @@ fn walk(
         "PRINT" | "LPRINT" | "?" => {
             let lpt = word == "LPRINT";
             parser.bump();
+            let channel = if !lpt && matches!(parser.cur, Tok::Punct(b'#')) {
+                parser.bump();
+                let n = parse_expr(parser)?;
+                expect_punct(parser, b',')?;
+                Some(n)
+            } else {
+                None
+            };
             let items = parse_print_items(parser)?;
             if mode == Mode::Run {
                 let (vm, host) = ctx.as_mut().ok_or_else(|| fault(SYNTAX, 2))?;
-                do_print(vm, host, lpt, &items)?;
+                if let Some(n) = channel {
+                    let num = cint_value(&eval_expr(vm, host, &n)?)?;
+                    let text = format_print(vm, host, &items)?;
+                    host.files.write_text(num, &text).map_err(file_fault)?;
+                } else {
+                    do_print(vm, host, lpt, &items)?;
+                }
             }
             Ok(Flow::Next)
         }
@@ -961,9 +1026,36 @@ fn walk(
         "DEFSNG" => exec_def(parser, Ty::Single, mode, ctx.as_mut()),
         "DEFDBL" => exec_def(parser, Ty::Double, mode, ctx.as_mut()),
         "DEFSTR" => exec_def(parser, Ty::Str, mode, ctx.as_mut()),
-        "DEF" => exec_def_fn(parser, mode, ctx.as_mut()),
+        "DEF" => {
+            parser.bump();
+            if name_is(&parser.cur, "SEG") {
+                exec_def_seg(parser, mode, ctx.as_mut())
+            } else {
+                exec_def_fn(parser, mode, ctx.as_mut())
+            }
+        }
         "SWAP" => exec_swap(parser, mode, ctx.as_mut()),
         "INPUT" => exec_input(parser, mode, ctx.as_mut(), false),
+        "WRITE" => exec_write(parser, mode, ctx.as_mut()),
+        "OPEN" => exec_open(parser, mode, ctx.as_mut()),
+        "CLOSE" => exec_close(parser, mode, ctx.as_mut()),
+        "LOAD" => exec_load(parser, mode, ctx.as_mut(), false),
+        "MERGE" => exec_merge(parser, mode, ctx.as_mut()),
+        "SAVE" => exec_save(parser, mode, ctx.as_mut()),
+        "CHAIN" => exec_load(parser, mode, ctx.as_mut(), true),
+        "KILL" => exec_kill(parser, mode, ctx.as_mut()),
+        "NAME" => exec_name(parser, mode, ctx.as_mut()),
+        "FILES" => exec_files(parser, mode, ctx.as_mut()),
+        "CHDIR" => exec_dir(parser, mode, ctx.as_mut(), DirOp::Chdir),
+        "MKDIR" => exec_dir(parser, mode, ctx.as_mut(), DirOp::Mkdir),
+        "RMDIR" => exec_dir(parser, mode, ctx.as_mut(), DirOp::Rmdir),
+        "SHELL" => exec_shell(parser, mode, ctx.as_mut()),
+        "POKE" => exec_poke(parser, mode, ctx.as_mut()),
+        "BSAVE" => exec_bsave(parser, mode, ctx.as_mut()),
+        "BLOAD" => exec_bload(parser, mode, ctx.as_mut()),
+        "SOUND" => exec_sound(parser, mode, ctx.as_mut()),
+        "ERROR" => exec_error(parser, mode, ctx.as_mut()),
+        "RESUME" => exec_resume(parser, mode, ctx.as_mut()),
         "LINE" => {
             parser.bump();
             if !parser.cur.is("INPUT") {
@@ -1021,6 +1113,9 @@ fn walk(
             let (start, end) = parse_list_range(parser)?;
             if mode == Mode::Run {
                 let (_, host) = ctx.as_mut().ok_or_else(|| fault(SYNTAX, 2))?;
+                if host.program.is_protected() {
+                    return Err(fault(ILLEGAL, 5));
+                }
                 let start = concrete_line(host.program, start)?;
                 let end = concrete_line(host.program, end)?;
                 let lines: Vec<String> = host
@@ -1049,10 +1144,8 @@ fn walk(
                 Ok(Flow::Next)
             }
         }
-        "POKE" | "CALL" | "OUT" | "WAIT" | "OPEN" | "CLOSE" | "LOAD" | "SAVE" | "FILES"
-        | "NAME" | "KILL" | "PLAY" | "SOUND" | "DRAW" | "PSET" | "PRESET" | "CIRCLE" | "PAINT"
-        | "SCREEN" | "KEY" | "EDIT" | "DELETE" | "AUTO" | "CHAIN" | "MERGE" | "BSAVE" | "BLOAD"
-        | "FIELD" | "GET" | "PUT" | "SHELL" | "WRITE" | "ERROR" => {
+        "CALL" | "OUT" | "WAIT" | "PLAY" | "DRAW" | "PSET" | "PRESET" | "CIRCLE" | "PAINT"
+        | "SCREEN" | "KEY" | "EDIT" | "DELETE" | "AUTO" | "FIELD" | "GET" | "PUT" => {
             // Recognized, not part of this milestone. Skip the rest of the statement.
             parser.bump();
             skip_statement(parser);
@@ -1218,11 +1311,19 @@ fn expect_punct(parser: &mut Parser<'_>, ch: u8) -> Result<(), RunErr> {
 }
 
 fn take_ident(parser: &mut Parser<'_>) -> Result<Ident, RunErr> {
-    let Tok::Ident(name) = &parser.cur else {
-        return Err(fault(SYNTAX, 2));
+    let name = match &parser.cur {
+        Tok::Ident(name) => name.clone(),
+        _ => return Err(fault(SYNTAX, 2)),
     };
-    let ident = Ident::parse(name);
     parser.bump();
+    let mut ident = Ident::parse(&name);
+    // `A#` is stored as the name bytes plus a `#` punctuation byte, same as
+    // the file mark in `AS #1`. A name absorbs that byte; `AS` does not,
+    // because this function is only called when a variable is expected.
+    if ident.suffix.is_none() && matches!(parser.cur, Tok::Punct(b'#')) {
+        ident.suffix = Some(Ty::Double);
+        parser.bump();
+    }
     Ok(ident)
 }
 
@@ -1412,6 +1513,10 @@ fn func_of(name: &str) -> Option<Func> {
         "CDBL" => Func::Cdbl,
         "FIX" => Func::Fix,
         "POS" => Func::Pos,
+        "PEEK" => Func::Peek,
+        "EOF" => Func::Eof,
+        "LOF" => Func::Lof,
+        "LOC" => Func::Loc,
         _ => return None,
     })
 }
@@ -1439,6 +1544,14 @@ fn arity(func: Func) -> (usize, usize) {
 }
 
 fn parse_primary(parser: &mut Parser<'_>) -> Result<Expr, RunErr> {
+    if matches!(parser.cur, Tok::Ident(_)) {
+        let ident = take_ident(parser)?;
+        return if matches!(parser.cur, Tok::Punct(b'(')) {
+            Ok(Expr::Index(ident, arg_list(parser)?))
+        } else {
+            Ok(Expr::Var(ident))
+        };
+    }
     match &parser.cur {
         Tok::Int(n) => {
             let n = *n;
@@ -1464,15 +1577,6 @@ fn parse_primary(parser: &mut Parser<'_>) -> Result<Expr, RunErr> {
             let text = bytes_string(bytes);
             parser.bump();
             Ok(Expr::Str(text))
-        }
-        Tok::Ident(name) => {
-            let ident = Ident::parse(name);
-            parser.bump();
-            if matches!(parser.cur, Tok::Punct(b'(')) {
-                Ok(Expr::Index(ident, arg_list(parser)?))
-            } else {
-                Ok(Expr::Var(ident))
-            }
         }
         Tok::Punct(b'(') => {
             parser.bump();
@@ -2005,7 +2109,7 @@ fn eval_call(vm: &mut Vm, host: &mut Host<'_>, func: Func, args: &[Expr]) -> Res
                     char::from(code as u8)
                 }
             };
-            Ok(Value::Str(std::iter::repeat(ch).take(n).collect()))
+            Ok(Value::Str(std::iter::repeat_n(ch, n).collect()))
         }
         Func::Space => Ok(Value::Str(" ".repeat(need_len(&values[0])?))),
         Func::Hex => Ok(Value::Str(format!(
@@ -2085,6 +2189,26 @@ fn eval_call(vm: &mut Vm, host: &mut Host<'_>, func: Func, args: &[Expr]) -> Res
         Func::Pos => {
             let _ = value_num(&values[0])?;
             Ok(Value::Int(host.screen.cursor().1 as i16 + 1))
+        }
+        Func::Peek => {
+            if host.program.is_protected() {
+                return Err(fault(ILLEGAL, 5));
+            }
+            let addr = u16_addr(&values[0])?;
+            Ok(Value::Int(i16::from(vm.memory[addr as usize])))
+        }
+        Func::Eof => {
+            let n = cint_value(&values[0])?;
+            let end = host.files.eof(n).map_err(file_fault)?;
+            Ok(Value::Int(if end { -1 } else { 0 }))
+        }
+        Func::Lof => {
+            let n = cint_value(&values[0])?;
+            Ok(value_from_i32(host.files.lof(n).map_err(file_fault)?))
+        }
+        Func::Loc => {
+            let n = cint_value(&values[0])?;
+            Ok(value_from_i32(host.files.loc(n).map_err(file_fault)?))
         }
         Func::Unsupported => Err(fault(ILLEGAL, 5)),
     }
@@ -2723,7 +2847,6 @@ fn parse_target(parser: &mut Parser<'_>) -> Result<Target, RunErr> {
 fn target_ty(vm: &Vm, target: &Target) -> Result<Ty, RunErr> {
     match target {
         Target::Var(ident) | Target::Index(ident, _) => Ok(ident.resolve(&vm.defs).ty),
-        Target::Mid { .. } => Err(fault(SYNTAX, 2)),
     }
 }
 
@@ -2735,7 +2858,6 @@ fn load_target(vm: &mut Vm, host: &mut Host<'_>, target: &Target) -> Result<Valu
             let idx = eval_indexes(vm, host, exprs)?;
             load_elem(vm, &name, &idx)
         }
-        Target::Mid { .. } => Err(fault(SYNTAX, 2)),
     }
 }
 
@@ -2752,7 +2874,6 @@ fn store_target(
             let idx = eval_indexes(vm, host, exprs)?;
             store_elem(vm, name, &idx, value)
         }
-        Target::Mid { .. } => Err(fault(SYNTAX, 2)),
     }
 }
 
@@ -2987,8 +3108,8 @@ fn scan_wend(program: &Program, mut line: u16, mut offset: usize) -> Result<Ip, 
         loop {
             match crunch::next_tok(&code, &mut i) {
                 Tok::End => break,
-                Tok::Word(w) if w == "WHILE" => depth += 1,
-                Tok::Word(w) if w == "WEND" => {
+                Tok::Word("WHILE") => depth += 1,
+                Tok::Word("WEND") => {
                     if depth == 0 {
                         return Ok(Ip {
                             line: Some(line),
@@ -3017,8 +3138,8 @@ fn scan_direct_wend(code: &[u8], offset: usize) -> Result<usize, RunErr> {
     loop {
         match crunch::next_tok(code, &mut i) {
             Tok::End | Tok::Rem(_) | Tok::Tick(_) => return Err(fault(WHILE_WITHOUT, 29)),
-            Tok::Word(w) if w == "WHILE" => depth += 1,
-            Tok::Word(w) if w == "WEND" => {
+            Tok::Word("WHILE") => depth += 1,
+            Tok::Word("WEND") => {
                 if depth == 0 {
                     return Ok(i);
                 }
@@ -3035,6 +3156,21 @@ fn exec_on(
     ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
 ) -> Result<Flow, RunErr> {
     parser.bump();
+    if parser.cur.is("ERROR") {
+        parser.bump();
+        expect_word(parser, "GOTO")?;
+        let dest = parse_line_ref(parser)?;
+        if mode == Mode::Check {
+            return Ok(Flow::Next);
+        }
+        let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+        ctx.0.on_error = match dest {
+            LineRef::Num(0) => None,
+            LineRef::Num(n) => Some(n),
+            LineRef::Dot => Some(ctx.1.program.last.ok_or_else(|| fault(UNDEF_LINE, 8))?),
+        };
+        return Ok(Flow::Next);
+    }
     let expr = parse_expr(parser)?;
     let gosub = if parser.cur.is("GOSUB") {
         true
@@ -3399,6 +3535,9 @@ fn exec_input(
     line_input: bool,
 ) -> Result<Flow, RunErr> {
     parser.bump();
+    if matches!(parser.cur, Tok::Punct(b'#')) {
+        return exec_file_input(parser, mode, ctx, line_input);
+    }
     if !line_input && matches!(parser.cur, Tok::Punct(b';')) {
         parser.bump();
     }
@@ -3454,7 +3593,6 @@ fn exec_input(
                 let _ = ensure_array(ctx.0, &name)?;
                 slots.push(InSlot::Elem(name, idx));
             }
-            Target::Mid { .. } => return Err(fault(SYNTAX, 2)),
         }
     }
     ctx.0.pending = Some(Pending {
@@ -3722,4 +3860,965 @@ fn assign_clock(
         ctx.0.time_override = Some(text);
     }
     Ok(Flow::Next)
+}
+
+fn name_is(tok: &Tok, name: &str) -> bool {
+    match tok {
+        Tok::Word(word) => word.eq_ignore_ascii_case(name),
+        Tok::Ident(ident) => ident.eq_ignore_ascii_case(name),
+        _ => false,
+    }
+}
+
+/// `FOR OUTPUT AS` crunches `OUTPUT` and `AS` as plain letters. A file that
+/// dropped the separating space stores them as one name, `OUTPUTAS`.
+fn take_open_mode(parser: &mut Parser<'_>) -> Result<(String, bool), RunErr> {
+    let upper = take_name(parser)?.to_ascii_uppercase();
+    for mode in ["OUTPUT", "APPEND", "RANDOM", "INPUT"] {
+        let Some(rest) = upper.strip_prefix(mode) else {
+            continue;
+        };
+        if rest.is_empty() {
+            return Ok((mode.to_string(), false));
+        }
+        if rest == "AS" {
+            return Ok((mode.to_string(), true));
+        }
+    }
+    Err(fault(SYNTAX, 2))
+}
+
+fn take_name(parser: &mut Parser<'_>) -> Result<String, RunErr> {
+    if !matches!(parser.cur, Tok::Word(_) | Tok::Ident(_)) {
+        return Err(fault(SYNTAX, 2));
+    }
+    let name = match &parser.cur {
+        Tok::Word(word) => (*word).to_string(),
+        Tok::Ident(ident) => ident.clone(),
+        _ => return Err(fault(SYNTAX, 2)),
+    };
+    parser.bump();
+    Ok(name)
+}
+
+fn expect_name(parser: &mut Parser<'_>, name: &str) -> Result<(), RunErr> {
+    if name_is(&parser.cur, name) {
+        parser.bump();
+        Ok(())
+    } else {
+        Err(fault(SYNTAX, 2))
+    }
+}
+
+fn file_fault(message: &'static str) -> RunErr {
+    let code = match message {
+        files::BAD_FILE_NUMBER => 52,
+        files::FILE_NOT_FOUND => 53,
+        files::BAD_FILE_MODE => 54,
+        files::FILE_ALREADY_OPEN => 55,
+        files::FILE_ALREADY_EXISTS => 58,
+        files::INPUT_PAST_END => 62,
+        files::BAD_FILE_NAME => 64,
+        files::PERMISSION_DENIED => 70,
+        files::PATH_NOT_FOUND => 76,
+        files::OUT_OF_MEMORY => 7,
+        _ => 75,
+    };
+    fault(message, code)
+}
+
+fn value_from_i32(n: i32) -> Value {
+    if (-32768..=32767).contains(&n) {
+        Value::Int(n as i16)
+    } else {
+        Value::Single(Mbf::from_i32(n, false))
+    }
+}
+
+fn u16_addr(value: &Value) -> Result<u16, RunErr> {
+    let number = to_mbf(value_num(value)?, true)?;
+    let rounded = number.to_f64().round();
+    if !(0.0..=65535.0).contains(&rounded) {
+        return Err(fault(ILLEGAL, 5));
+    }
+    Ok(rounded as u16)
+}
+
+fn byte_of(value: &Value) -> Result<u8, RunErr> {
+    let n = u16_addr(value)?;
+    if n > 255 {
+        Err(fault(ILLEGAL, 5))
+    } else {
+        Ok(n as u8)
+    }
+}
+
+fn message_for(code: i16) -> &'static str {
+    match code {
+        1 => NEXT_WITHOUT,
+        2 => SYNTAX,
+        3 => RETURN_WITHOUT,
+        4 => OUT_OF_DATA,
+        5 => ILLEGAL,
+        6 => OVERFLOW,
+        7 => OUT_OF_MEMORY,
+        8 => UNDEF_LINE,
+        9 => SUBSCRIPT,
+        11 => DIV0,
+        13 => TYPE_MISMATCH,
+        15 => STRING_LONG,
+        17 => "Can't continue",
+        18 => "Undefined user function",
+        20 => RESUME_WITHOUT,
+        22 => MISSING,
+        29 => WHILE_WITHOUT,
+        30 => WEND_WITHOUT,
+        52 => files::BAD_FILE_NUMBER,
+        53 => files::FILE_NOT_FOUND,
+        54 => files::BAD_FILE_MODE,
+        55 => files::FILE_ALREADY_OPEN,
+        58 => files::FILE_ALREADY_EXISTS,
+        62 => files::INPUT_PAST_END,
+        64 => files::BAD_FILE_NAME,
+        70 => files::PERMISSION_DENIED,
+        75 => files::PATH_FILE_ACCESS,
+        76 => files::PATH_NOT_FOUND,
+        _ => UNPRINTABLE,
+    }
+}
+
+fn value_text(value: &Value) -> Result<String, RunErr> {
+    match value {
+        Value::Str(text) => Ok(text.clone()),
+        other => {
+            let number = value_num(other)?;
+            let double = matches!(number, Number::Double(_));
+            let mut text = to_mbf(number, double)?.format_number();
+            text.push(' ');
+            Ok(text)
+        }
+    }
+}
+
+fn push_text(out: &mut String, col: &mut usize, text: &str) {
+    for ch in text.chars() {
+        if ch == '\n' {
+            out.push('\n');
+            *col = 0;
+        } else {
+            out.push(ch);
+            *col += 1;
+        }
+    }
+}
+
+fn format_print(vm: &mut Vm, host: &mut Host<'_>, items: &[PrintItem]) -> Result<String, RunErr> {
+    if items.is_empty() {
+        return Ok("\n".to_string());
+    }
+    let width = host.screen.width();
+    let mut out = String::new();
+    let mut col = 0usize;
+    let mut suppress = false;
+    for item in items {
+        match &item.part {
+            PrintPart::Expr(expr) => {
+                let text = value_text(&eval_expr(vm, host, expr)?)?;
+                push_text(&mut out, &mut col, &text);
+            }
+            PrintPart::Tab(expr) => {
+                let n = i32::from(cint_value(&eval_expr(vm, host, expr)?)?);
+                if n < 1 {
+                    return Err(fault(ILLEGAL, 5));
+                }
+                let target = (n as usize).saturating_sub(1);
+                if col > target {
+                    push_text(&mut out, &mut col, "\n");
+                }
+                let pad = target.saturating_sub(col);
+                push_text(&mut out, &mut col, &" ".repeat(pad));
+            }
+            PrintPart::Spc(expr) => {
+                let n = cint_value(&eval_expr(vm, host, expr)?)?;
+                if n < 0 {
+                    return Err(fault(ILLEGAL, 5));
+                }
+                push_text(&mut out, &mut col, &" ".repeat(n as usize));
+            }
+            PrintPart::Blank => {}
+            PrintPart::Using(fmt, vals) => {
+                let fmt = need_str(&eval_expr(vm, host, fmt)?)?;
+                let mut values = Vec::new();
+                for value in vals {
+                    values.push(eval_expr(vm, host, value)?);
+                }
+                let text = format_using(&fmt, &values)?;
+                push_text(&mut out, &mut col, &text);
+            }
+        }
+        match item.sep {
+            Sep::Semi => suppress = true,
+            Sep::Comma => {
+                let next = (col / 14 + 1) * 14;
+                if next >= width {
+                    push_text(&mut out, &mut col, "\n");
+                } else {
+                    let spaces = " ".repeat(next - col);
+                    push_text(&mut out, &mut col, &spaces);
+                }
+                suppress = true;
+            }
+            Sep::None => suppress = false,
+        }
+    }
+    if !suppress {
+        push_text(&mut out, &mut col, "\n");
+    }
+    Ok(out)
+}
+
+fn format_write(values: &[Value]) -> Result<String, RunErr> {
+    let mut parts = Vec::new();
+    for value in values {
+        match value {
+            Value::Str(text) => parts.push(format!("\"{text}\"")),
+            other => {
+                let number = value_num(other)?;
+                let double = matches!(number, Number::Double(_));
+                let mut text = to_mbf(number, double)?.format_number();
+                if text.starts_with(' ') {
+                    text.remove(0);
+                }
+                parts.push(text);
+            }
+        }
+    }
+    let mut line = parts.join(",");
+    line.push('\n');
+    Ok(line)
+}
+
+pub fn load_bytes(program: &mut Program, bytes: &[u8]) -> Result<(), &'static str> {
+    if matches!(bytes.first(), Some(0xFF | 0xFE)) {
+        let decoded = files::decode_tokenized(bytes)?;
+        program.clear();
+        for (number, tokens) in decoded.lines {
+            let listed = crunch::list_tokens(&tokens);
+            program.insert(number, tokens, format!("{number} {listed}"));
+        }
+        program.set_protected(decoded.protected);
+        Ok(())
+    } else {
+        load_ascii(program, &files::decode_ascii(bytes), true)
+    }
+}
+
+fn load_ascii(program: &mut Program, text: &str, replace: bool) -> Result<(), &'static str> {
+    if replace {
+        program.clear();
+    }
+    for line in text.split('\n') {
+        let line = line.trim_end_matches('\r').trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (number, rest) = numbered_source(line).map_err(|err| err.message)?;
+        store_source_line(program, number, rest).map_err(|fault| match fault.kind {
+            crate::crunch::FaultKind::Overflow => OVERFLOW,
+            crate::crunch::FaultKind::Syntax => SYNTAX,
+        })?;
+    }
+    Ok(())
+}
+
+fn numbered_source(text: &str) -> Result<(u16, &str), RunErr> {
+    let bytes = text.as_bytes();
+    if !bytes.first().is_some_and(|b| b.is_ascii_digit()) {
+        return Err(fault(SYNTAX, 2));
+    }
+    let mut index = 0;
+    let mut number: u32 = 0;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        number = number
+            .saturating_mul(10)
+            .saturating_add(u32::from(bytes[index] - b'0'));
+        if number > 65529 {
+            return Err(fault(SYNTAX, 2));
+        }
+        index += 1;
+    }
+    Ok((number as u16, &text[index..]))
+}
+
+fn eval_string(vm: &mut Vm, host: &mut Host<'_>, expr: &Expr) -> Result<String, RunErr> {
+    need_str(&eval_expr(vm, host, expr)?)
+}
+
+fn file_number(parser: &mut Parser<'_>) -> Result<Expr, RunErr> {
+    if matches!(parser.cur, Tok::Punct(b'#')) {
+        parser.bump();
+    }
+    parse_expr(parser)
+}
+
+fn exec_file_input(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+    line_input: bool,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let number = file_number(parser)?;
+    expect_punct(parser, b',')?;
+    let mut targets = Vec::new();
+    loop {
+        targets.push(parse_target(parser)?);
+        if matches!(parser.cur, Tok::Punct(b',')) {
+            if line_input {
+                return Err(fault(SYNTAX, 2));
+            }
+            parser.bump();
+            continue;
+        }
+        break;
+    }
+    if targets.is_empty() {
+        return Err(fault(SYNTAX, 2));
+    }
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let number = cint_value(&eval_expr(ctx.0, ctx.1, &number)?)?;
+    for target in targets {
+        let text = if line_input {
+            ctx.1.files.read_line(number)
+        } else {
+            ctx.1.files.read_field(number)
+        }
+        .map_err(file_fault)?;
+        let ty = target_ty(ctx.0, &target)?;
+        let value = if line_input {
+            if ty != Ty::Str {
+                return Err(fault(TYPE_MISMATCH, 13));
+            }
+            if text.len() > 255 {
+                return Err(fault(STRING_LONG, 15));
+            }
+            Value::Str(text)
+        } else {
+            coerce_field(&text, ty).map_err(field_fault)?
+        };
+        store_target(ctx.0, ctx.1, &target, value)?;
+    }
+    Ok(Flow::Next)
+}
+
+fn exec_write(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let channel = if matches!(parser.cur, Tok::Punct(b'#')) {
+        parser.bump();
+        let number = parse_expr(parser)?;
+        expect_punct(parser, b',')?;
+        Some(number)
+    } else {
+        None
+    };
+    let mut exprs = Vec::new();
+    if !terminated(&parser.cur) {
+        loop {
+            exprs.push(parse_expr(parser)?);
+            if matches!(parser.cur, Tok::Punct(b',')) {
+                parser.bump();
+                if terminated(&parser.cur) {
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+    }
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let mut values = Vec::new();
+    for expr in &exprs {
+        values.push(eval_expr(ctx.0, ctx.1, expr)?);
+    }
+    let text = format_write(&values)?;
+    if let Some(number) = channel {
+        let number = cint_value(&eval_expr(ctx.0, ctx.1, &number)?)?;
+        ctx.1.files.write_text(number, &text).map_err(file_fault)?;
+    } else {
+        emit(ctx.1, &text);
+    }
+    Ok(Flow::Next)
+}
+
+fn exec_open(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let first = parse_expr(parser)?;
+    let (filename, mode_expr, mode_name, number, words) = if parser.cur.is("FOR") {
+        parser.bump();
+        let (mode_name, as_taken) = take_open_mode(parser)?;
+        if !as_taken {
+            expect_name(parser, "AS")?;
+        }
+        let number = file_number(parser)?;
+        if name_is(&parser.cur, "LEN") {
+            parser.bump();
+            expect_word(parser, "=")?;
+            let _ = parse_expr(parser)?;
+        }
+        (first, None, mode_name, number, true)
+    } else {
+        expect_punct(parser, b',')?;
+        let number = file_number(parser)?;
+        expect_punct(parser, b',')?;
+        let filename = parse_expr(parser)?;
+        if matches!(parser.cur, Tok::Punct(b',')) {
+            parser.bump();
+            let _ = parse_expr(parser)?;
+        }
+        (filename, Some(first), String::new(), number, false)
+    };
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let filename = eval_string(ctx.0, ctx.1, &filename)?;
+    let number = cint_value(&eval_expr(ctx.0, ctx.1, &number)?)?;
+    let seq = if words {
+        match mode_name.to_ascii_uppercase().as_str() {
+            "INPUT" => SeqMode::Input,
+            "OUTPUT" => SeqMode::Output,
+            "APPEND" => SeqMode::Append,
+            "RANDOM" => return Err(fault(files::BAD_FILE_MODE, 54)),
+            _ => return Err(fault(SYNTAX, 2)),
+        }
+    } else {
+        let mode_text = eval_string(ctx.0, ctx.1, mode_expr.as_ref().unwrap())?;
+        match mode_text.chars().next().map(|ch| ch.to_ascii_uppercase()) {
+            Some('I') => SeqMode::Input,
+            Some('O') => SeqMode::Output,
+            Some('A') => SeqMode::Append,
+            Some('R') => return Err(fault(files::BAD_FILE_MODE, 54)),
+            _ => return Err(fault(files::BAD_FILE_MODE, 54)),
+        }
+    };
+    ctx.1
+        .files
+        .open(number, &filename, seq)
+        .map_err(file_fault)?;
+    Ok(Flow::Next)
+}
+
+fn exec_close(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let mut numbers = Vec::new();
+    if !terminated(&parser.cur) {
+        loop {
+            numbers.push(file_number(parser)?);
+            if matches!(parser.cur, Tok::Punct(b',')) {
+                parser.bump();
+                continue;
+            }
+            break;
+        }
+    }
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    if numbers.is_empty() {
+        ctx.1.files.close_all();
+        return Ok(Flow::Next);
+    }
+    for number in numbers {
+        let number = cint_value(&eval_expr(ctx.0, ctx.1, &number)?)?;
+        ctx.1.files.close(number).map_err(file_fault)?;
+    }
+    Ok(Flow::Next)
+}
+
+fn exec_save(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let name = parse_expr(parser)?;
+    let kind = if matches!(parser.cur, Tok::Punct(b',')) {
+        parser.bump();
+        match take_name(parser)?.to_ascii_uppercase().as_str() {
+            "A" => SaveKind::Ascii,
+            "P" => SaveKind::Protected,
+            _ => return Err(fault(SYNTAX, 2)),
+        }
+    } else {
+        SaveKind::Tokenized
+    };
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    if ctx.1.program.is_protected() && kind != SaveKind::Protected {
+        return Err(fault(ILLEGAL, 5));
+    }
+    let name = eval_string(ctx.0, ctx.1, &name)?;
+    let path = files::bas_path(&name).map_err(file_fault)?;
+    let bytes = match kind {
+        SaveKind::Ascii => files::encode_ascii(&ctx.1.program.listing()),
+        SaveKind::Tokenized | SaveKind::Protected => {
+            let owned = ctx.1.program.line_pairs();
+            let view: Vec<(u16, &[u8])> =
+                owned.iter().map(|(n, tok)| (*n, tok.as_slice())).collect();
+            files::encode_tokenized(&view, kind == SaveKind::Protected).map_err(file_fault)?
+        }
+    };
+    files::write_bytes(&path, &bytes).map_err(file_fault)?;
+    Ok(Flow::Next)
+}
+
+fn exec_load(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+    chain: bool,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let name = parse_expr(parser)?;
+    let mut run = chain;
+    let mut start = None;
+    if matches!(parser.cur, Tok::Punct(b',')) {
+        parser.bump();
+        if chain && is_line_ref(&parser.cur) {
+            start = Some(parse_line_ref(parser)?);
+        } else if !chain && name_is(&parser.cur, "R") {
+            parser.bump();
+            run = true;
+        } else {
+            return Err(fault(SYNTAX, 2));
+        }
+    }
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let name = eval_string(ctx.0, ctx.1, &name)?;
+    let path = files::bas_path(&name).map_err(file_fault)?;
+    let bytes = files::read_bytes(&path).map_err(file_fault)?;
+    load_bytes(ctx.1.program, &bytes).map_err(file_fault)?;
+    let start = match start {
+        Some(dest) => match dest {
+            LineRef::Num(n) => Some(n),
+            LineRef::Dot => ctx.1.program.last,
+        },
+        None => None,
+    };
+    if run {
+        if begin_program(ctx.0, ctx.1.program, start) {
+            return Ok(Flow::Jump(ctx.0.ip));
+        }
+    } else {
+        ctx.0.reset_runtime();
+    }
+    Ok(Flow::Ended)
+}
+
+fn exec_merge(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let name = parse_expr(parser)?;
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    if ctx.1.program.is_protected() {
+        return Err(fault(ILLEGAL, 5));
+    }
+    let name = eval_string(ctx.0, ctx.1, &name)?;
+    let path = files::bas_path(&name).map_err(file_fault)?;
+    let bytes = files::read_bytes(&path).map_err(file_fault)?;
+    if matches!(bytes.first(), Some(0xFF | 0xFE)) {
+        return Err(fault(files::BAD_FILE_MODE, 54));
+    }
+    load_ascii(ctx.1.program, &files::decode_ascii(&bytes), false).map_err(file_fault)?;
+    Ok(Flow::Next)
+}
+
+fn exec_kill(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let name = parse_expr(parser)?;
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let name = eval_string(ctx.0, ctx.1, &name)?;
+    files::kill(&name).map_err(file_fault)?;
+    Ok(Flow::Next)
+}
+
+fn exec_name(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let from = parse_expr(parser)?;
+    expect_name(parser, "AS")?;
+    let to = parse_expr(parser)?;
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let from = eval_string(ctx.0, ctx.1, &from)?;
+    let to = eval_string(ctx.0, ctx.1, &to)?;
+    files::rename_file(&from, &to).map_err(file_fault)?;
+    Ok(Flow::Next)
+}
+
+fn exec_files(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let spec = if terminated(&parser.cur) {
+        None
+    } else {
+        Some(parse_expr(parser)?)
+    };
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let spec = if let Some(spec) = spec {
+        eval_string(ctx.0, ctx.1, &spec)?
+    } else {
+        String::new()
+    };
+    let names = files::list_dir(&spec).map_err(file_fault)?;
+    if names.is_empty() {
+        emit(ctx.1, "File not found\n");
+    } else {
+        for name in names {
+            emit(ctx.1, &name);
+            emit(ctx.1, "\n");
+        }
+    }
+    Ok(Flow::Next)
+}
+
+#[derive(Clone, Copy)]
+enum DirOp {
+    Chdir,
+    Mkdir,
+    Rmdir,
+}
+
+fn exec_dir(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+    op: DirOp,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let path = parse_expr(parser)?;
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let path = eval_string(ctx.0, ctx.1, &path)?;
+    let result = match op {
+        DirOp::Chdir => files::chdir(&path),
+        DirOp::Mkdir => files::mkdir(&path),
+        DirOp::Rmdir => files::rmdir(&path),
+    };
+    result.map_err(file_fault)?;
+    Ok(Flow::Next)
+}
+
+fn exec_shell(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let command = if terminated(&parser.cur) {
+        None
+    } else {
+        Some(parse_expr(parser)?)
+    };
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let command = if let Some(command) = command {
+        eval_string(ctx.0, ctx.1, &command)?
+    } else {
+        String::new()
+    };
+    let text = files::run_shell(&command).map_err(file_fault)?;
+    if !text.is_empty() {
+        emit(ctx.1, &text);
+        if !text.ends_with('\n') {
+            emit(ctx.1, "\n");
+        }
+    }
+    Ok(Flow::Next)
+}
+
+fn guard_memory(program: &Program) -> Result<(), RunErr> {
+    if program.is_protected() {
+        Err(fault(ILLEGAL, 5))
+    } else {
+        Ok(())
+    }
+}
+
+fn exec_poke(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let addr = parse_expr(parser)?;
+    expect_punct(parser, b',')?;
+    let value = parse_expr(parser)?;
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    guard_memory(ctx.1.program)?;
+    let addr = u16_addr(&eval_expr(ctx.0, ctx.1, &addr)?)?;
+    let value = byte_of(&eval_expr(ctx.0, ctx.1, &value)?)?;
+    ctx.0.memory[addr as usize] = value;
+    Ok(Flow::Next)
+}
+
+fn exec_def_seg(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let segment = if parser.cur.is("=") {
+        parser.bump();
+        Some(parse_expr(parser)?)
+    } else {
+        None
+    };
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    ctx.0.segment = if let Some(segment) = segment {
+        u16_addr(&eval_expr(ctx.0, ctx.1, &segment)?)?
+    } else {
+        0
+    };
+    Ok(Flow::Next)
+}
+
+fn exec_bsave(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let name = parse_expr(parser)?;
+    expect_punct(parser, b',')?;
+    let offset = parse_expr(parser)?;
+    expect_punct(parser, b',')?;
+    let length = parse_expr(parser)?;
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    guard_memory(ctx.1.program)?;
+    let name = eval_string(ctx.0, ctx.1, &name)?;
+    let offset = u16_addr(&eval_expr(ctx.0, ctx.1, &offset)?)?;
+    let length = u16_addr(&eval_expr(ctx.0, ctx.1, &length)?)?;
+    let path = files::plain_path(&name).map_err(file_fault)?;
+    let start = offset as usize;
+    let end = start
+        .saturating_add(length as usize)
+        .min(ctx.0.memory.len());
+    let mut bytes = vec![0xFD];
+    bytes.extend_from_slice(&ctx.0.segment.to_le_bytes());
+    bytes.extend_from_slice(&offset.to_le_bytes());
+    bytes.extend_from_slice(&(length).to_le_bytes());
+    bytes.extend_from_slice(&ctx.0.memory[start..end]);
+    files::write_bytes(&path, &bytes).map_err(file_fault)?;
+    Ok(Flow::Next)
+}
+
+fn exec_bload(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let name = parse_expr(parser)?;
+    let offset = if matches!(parser.cur, Tok::Punct(b',')) {
+        parser.bump();
+        Some(parse_expr(parser)?)
+    } else {
+        None
+    };
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    guard_memory(ctx.1.program)?;
+    let name = eval_string(ctx.0, ctx.1, &name)?;
+    let path = files::plain_path(&name).map_err(file_fault)?;
+    let bytes = files::read_bytes(&path).map_err(file_fault)?;
+    if bytes.first() != Some(&0xFD) || bytes.len() < 7 {
+        return Err(fault(files::BAD_FILE_MODE, 54));
+    }
+    let stored = u16::from_le_bytes([bytes[3], bytes[4]]);
+    let offset = if let Some(offset) = offset {
+        u16_addr(&eval_expr(ctx.0, ctx.1, &offset)?)?
+    } else {
+        stored
+    };
+    let data = &bytes[7..];
+    let start = offset as usize;
+    let end = start.saturating_add(data.len()).min(ctx.0.memory.len());
+    let count = end - start;
+    ctx.0.memory[start..end].copy_from_slice(&data[..count]);
+    Ok(Flow::Next)
+}
+
+fn exec_sound(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let freq = parse_expr(parser)?;
+    expect_punct(parser, b',')?;
+    let duration = parse_expr(parser)?;
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let freq = u16_addr(&eval_expr(ctx.0, ctx.1, &freq)?)?;
+    let duration = cint_value(&eval_expr(ctx.0, ctx.1, &duration)?)?;
+    if !(37..=32767).contains(&freq) || duration < 0 {
+        return Err(fault(ILLEGAL, 5));
+    }
+    let ms = ((f64::from(duration) * 1000.0) / 18.2).round() as u32;
+    *ctx.1.tone = Some((u32::from(freq), ms.max(1)));
+    Ok(Flow::Next)
+}
+
+fn exec_error(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let code = parse_expr(parser)?;
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let code = cint_value(&eval_expr(ctx.0, ctx.1, &code)?)?;
+    if !(0..=255).contains(&code) {
+        return Err(fault(ILLEGAL, 5));
+    }
+    Err(fault(message_for(code), code))
+}
+
+fn exec_resume(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let how = if parser.cur.is("NEXT") {
+        parser.bump();
+        ResumeHow::Next
+    } else if is_line_ref(&parser.cur) {
+        ResumeHow::Line(parse_line_ref(parser)?)
+    } else {
+        ResumeHow::Same
+    };
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    if !ctx.0.handling_error {
+        return Err(fault(RESUME_WITHOUT, 20));
+    }
+    ctx.0.handling_error = false;
+    let ip = match how {
+        ResumeHow::Same => ctx.0.resume_at.ok_or_else(|| fault(RESUME_WITHOUT, 20))?,
+        ResumeHow::Next => {
+            let at = ctx.0.resume_at.ok_or_else(|| fault(RESUME_WITHOUT, 20))?;
+            skip_resumed(ctx.1.program, &ctx.0.direct, at)?
+        }
+        ResumeHow::Line(dest) => resolve_line(ctx.0, ctx.1.program, dest)?,
+    };
+    Ok(Flow::Jump(ip))
+}
+
+enum ResumeHow {
+    Same,
+    Next,
+    Line(LineRef),
+}
+
+fn skip_resumed(program: &Program, direct: &[u8], ip: Ip) -> Result<Ip, RunErr> {
+    let code = if let Some(number) = ip.line {
+        program
+            .code(number)
+            .ok_or_else(|| fault(UNDEF_LINE, 8))?
+            .to_vec()
+    } else {
+        direct.to_vec()
+    };
+    let mut parser = Parser::new(&code, ip.offset);
+    skip_statement(&mut parser);
+    if matches!(parser.cur, Tok::End) {
+        if let Some(number) = ip.line {
+            if let Some(next) = program.next_after(number) {
+                return Ok(Ip {
+                    line: Some(next),
+                    offset: 0,
+                });
+            }
+        }
+        return Ok(Ip {
+            line: ip.line,
+            offset: parser.i,
+        });
+    }
+    Ok(Ip {
+        line: ip.line,
+        offset: here(&parser),
+    })
 }

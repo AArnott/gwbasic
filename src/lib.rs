@@ -3,6 +3,7 @@
 
 mod basic;
 mod crunch;
+mod files;
 mod font;
 mod input;
 mod keys;

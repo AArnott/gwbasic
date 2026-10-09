@@ -118,9 +118,7 @@ impl ApplicationHandler for App {
                 }
                 if let Some(input) = map_key(&event, self.mods) {
                     self.session.handle(input);
-                    if self.session.take_beep() {
-                        start_beep();
-                    }
+                    play_pending(&mut self.session);
                     if self.session.quit() {
                         event_loop.exit();
                         return;
@@ -142,9 +140,7 @@ impl ApplicationHandler for App {
         }
         event_loop.set_control_flow(ControlFlow::Poll);
         self.session.poll();
-        if self.session.take_beep() {
-            start_beep();
-        }
+        play_pending(&mut self.session);
         if self.session.quit() {
             event_loop.exit();
             return;
@@ -231,8 +227,8 @@ fn paint(buffer: &mut [u32], win_w: usize, win_h: usize, session: &Session) {
             let fg = PALETTE[(attr & 0x0F) as usize];
             let bg = PALETTE[((attr >> 4) & 0x0F) as usize];
             let cursor_here = !strip_row && row == cur_row && col == cur_col;
-            for gy in 0..CELL_H {
-                let bits = glyph[gy];
+            for (gy, bits) in glyph.iter().enumerate() {
+                let bits = *bits;
                 let invert = cursor_here && (!insert || gy >= CELL_H / 2);
                 let (fg, bg) = if invert { (bg, fg) } else { (fg, bg) };
                 for gx in 0..CELL_W {
@@ -364,13 +360,37 @@ fn map_named(key: NamedKey, ctrl: bool) -> Option<Input> {
     }
 }
 
-fn start_beep() {
+fn play_pending(session: &mut Session) {
+    if let Some((freq, ms)) = session.take_tone() {
+        start_tone(freq, ms);
+    } else if session.take_beep() {
+        start_tone(800, 200);
+    }
+}
+
+fn start_tone(freq: u32, ms: u32) {
+    std::thread::spawn(move || play_tone(freq, ms));
+}
+
+fn play_tone(freq: u32, ms: u32) {
     #[cfg(windows)]
+    unsafe {
+        // kernel32 Beep blocks, so the caller runs it off the window thread.
+        let _ = Beep(freq, ms);
+    }
+    #[cfg(target_os = "macos")]
     {
-        std::thread::spawn(|| unsafe {
-            // kernel32 Beep blocks, so it stays off the window thread.
-            let _ = Beep(800, 200);
-        });
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", "beep"])
+            .status();
+        let _ = (freq, ms);
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("paplay")
+            .arg("/usr/share/sounds/freedesktop/stereo/bell.oga")
+            .status();
+        let _ = (freq, ms);
     }
 }
 

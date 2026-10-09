@@ -62,9 +62,7 @@ pub fn ctrl_letter(c: char) -> Option<Input> {
 pub fn char_to_byte(c: char) -> Option<u8> {
     if c == '\u{2190}' {
         Some(0x1B)
-    } else if c >= ' ' && (c as u32) < 128 {
-        Some(c as u8)
-    } else if (c as u32) < 256 && c >= ' ' {
+    } else if c >= ' ' && (c as u32) < 256 {
         Some(c as u8)
     } else {
         None

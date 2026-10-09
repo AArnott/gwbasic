@@ -4,6 +4,7 @@
 
 use crate::basic;
 use crate::crunch::FaultKind;
+use crate::files;
 use crate::input::Input;
 use crate::keys::{FunctionKeys, MACRO_LEN};
 use crate::options::Options;
@@ -40,8 +41,10 @@ pub struct Session {
     quit: bool,
     paused: bool,
     beep_pending: bool,
+    tone: Option<(u32, u32)>,
     echo_printer: bool,
     lpt: String,
+    files: files::Files,
 }
 
 impl Default for Session {
@@ -68,13 +71,16 @@ impl Session {
             quit: false,
             paused: false,
             beep_pending: false,
+            tone: None,
             echo_printer: false,
             lpt: String::new(),
+            files: files::Files::new(3, 128),
         }
     }
 
     pub fn boot(&mut self, options: &Options) {
         self.vm.set_double_math(options.double_math);
+        self.files = files::Files::new(options.files, options.record_size);
         self.workspace = options
             .max_memory
             .unwrap_or(DEFAULT_WORKSPACE)
@@ -214,6 +220,10 @@ impl Session {
         pending
     }
 
+    pub fn take_tone(&mut self) -> Option<(u32, u32)> {
+        self.tone.take()
+    }
+
     /// A program is between statements and the window should keep polling so
     /// Ctrl+Break can land.
     pub fn needs_poll(&self) -> bool {
@@ -273,11 +283,10 @@ impl Session {
             Input::CtrlC => {}
             Input::Char(ch) => self.inkey.push_back(ch),
             Input::Enter => self.inkey.push_back(b'\r'),
-            Input::Function(n) => {
-                if (1..=10).contains(&n) {
-                    self.inkey.extend(self.keys.get(n).iter().copied());
-                }
+            Input::Function(n) if (1..=10).contains(&n) => {
+                self.inkey.extend(self.keys.get(n).iter().copied());
             }
+            Input::Function(_) => {}
             _ => {}
         }
     }
@@ -466,7 +475,7 @@ impl Session {
             "KEY" => self.cmd_key(rest),
             "RUN" => self.cmd_run(rest),
             "CONT" => self.cmd_bare(rest, |session| {
-                if basic::resume(&mut session.vm) {
+                if session.vm.can_continue() && basic::resume(&mut session.vm) {
                     session.pump_until_settled();
                 } else {
                     session.error(CANT_CONTINUE);
@@ -491,7 +500,19 @@ impl Session {
         }
     }
 
+    fn refuse_protected(&mut self) -> bool {
+        if self.program.is_protected() {
+            self.error(ILLEGAL);
+            true
+        } else {
+            false
+        }
+    }
+
     fn store_program_line(&mut self, number: u16, rest: &str) {
+        if self.refuse_protected() {
+            return;
+        }
         match put_line(&mut self.program, number, rest) {
             Ok(()) => self.vm.invalidate_cont(),
             Err(fault) => {
@@ -535,6 +556,8 @@ impl Session {
             key_offset: &mut self.keys.offset,
             trace: &mut self.trace,
             quit: &mut self.quit,
+            files: &mut self.files,
+            tone: &mut self.tone,
         };
         basic::burst(&mut self.vm, &mut host, budget)
     }
@@ -653,6 +676,9 @@ impl Session {
     }
 
     fn cmd_list(&mut self, rest: &str) {
+        if self.refuse_protected() {
+            return;
+        }
         let (start, end) = match parse_range(rest, self.program.last) {
             Ok(range) => range,
             Err(err) => {
@@ -674,6 +700,9 @@ impl Session {
     }
 
     fn cmd_delete(&mut self, rest: &str) {
+        if self.refuse_protected() {
+            return;
+        }
         if rest.trim().is_empty() {
             self.error(SYNTAX);
             return;
@@ -691,6 +720,9 @@ impl Session {
     }
 
     fn cmd_edit(&mut self, rest: &str) {
+        if self.refuse_protected() {
+            return;
+        }
         let rest = rest.trim();
         let number = if rest.is_empty() {
             match self.program.last {
@@ -736,6 +768,9 @@ impl Session {
     }
 
     fn cmd_auto(&mut self, rest: &str) {
+        if self.refuse_protected() {
+            return;
+        }
         let (start, step) = match parse_auto(rest, self.program.last) {
             Ok(pair) => pair,
             Err(err) => {
@@ -857,40 +892,15 @@ impl Session {
     fn load_program_file(&mut self, path: &Path) -> Result<(), String> {
         let path = resolve_bas(path);
         let bytes = std::fs::read(&path).map_err(|_| FILE_NOT_FOUND.to_string())?;
-        if matches!(bytes.first(), Some(0xFF | 0xFE)) {
-            return Err(ILLEGAL.to_string());
-        }
-        let text = decode_source(&bytes);
         let mut program = Program::default();
-        for line in text.split('\n') {
-            let line = line.trim_end_matches('\r').trim();
-            if line.is_empty() {
-                continue;
-            }
-            match split_program_line(line) {
-                Some(Ok((number, rest))) => {
-                    put_line(&mut program, number, rest).map_err(|fault| match fault.kind {
-                        FaultKind::Overflow => "Overflow".to_string(),
-                        FaultKind::Syntax => SYNTAX.to_string(),
-                    })?
-                }
-                Some(Err(())) | None => return Err(SYNTAX.to_string()),
-            }
-        }
+        basic::load_bytes(&mut program, &bytes).map_err(|err| err.to_string())?;
         self.program = program;
         Ok(())
     }
 }
 
 fn put_line(program: &mut Program, number: u16, rest: &str) -> Result<(), crate::crunch::Fault> {
-    if rest.trim().is_empty() {
-        program.delete_line(number);
-        return Ok(());
-    }
-    let tokens = basic::prepare(rest)?;
-    let listed = crate::crunch::list_tokens(&tokens);
-    program.insert(number, tokens, format!("{number} {listed}"));
-    Ok(())
+    basic::store_source_line(program, number, rest)
 }
 
 fn resolve_bas(path: &Path) -> std::path::PathBuf {
@@ -899,11 +909,6 @@ fn resolve_bas(path: &Path) -> std::path::PathBuf {
     } else {
         path.with_extension("BAS")
     }
-}
-
-fn decode_source(bytes: &[u8]) -> String {
-    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
-    bytes.iter().copied().map(char::from).collect()
 }
 
 /// A leading line number in 0..=65529, plus the untouched tail (which keeps
@@ -1370,8 +1375,10 @@ mod tests {
 
     #[test]
     fn memory_switch_changes_bytes_free() {
-        let mut options = Options::default();
-        options.max_memory = Some(32768);
+        let options = Options {
+            max_memory: Some(32768),
+            ..Options::default()
+        };
         let mut session = fresh();
         session.boot(&options);
         assert!(session.snapshot().contains("27532 Bytes free"));
@@ -1413,8 +1420,10 @@ mod tests {
     #[test]
     fn loads_ascii_before_the_banner_and_stays_up_when_load_fails() {
         let hello = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/hello.bas");
-        let mut options = Options::default();
-        options.program = Some(hello);
+        let options = Options {
+            program: Some(hello),
+            ..Options::default()
+        };
         let mut session = fresh();
         session.boot(&options);
         assert!(session.program_line(10).unwrap().contains("Hello"));
@@ -1422,8 +1431,10 @@ mod tests {
         assert!(!session.snapshot().contains("60300 Bytes free"));
         assert!(!session.quit());
 
-        let mut missing = Options::default();
-        missing.program = Some(std::path::PathBuf::from("no-such-gwbasic-program"));
+        let missing = Options {
+            program: Some(std::path::PathBuf::from("no-such-gwbasic-program")),
+            ..Options::default()
+        };
         let mut session = fresh();
         session.boot(&missing);
         assert!(session.snapshot().contains(FILE_NOT_FOUND));
@@ -1432,8 +1443,10 @@ mod tests {
 
         let path = std::env::temp_dir().join("gwbasic-milestone1-token.bas");
         std::fs::write(&path, [0xFF, 0x01, 0x00]).unwrap();
-        let mut tokenized = Options::default();
-        tokenized.program = Some(path);
+        let tokenized = Options {
+            program: Some(path),
+            ..Options::default()
+        };
         let mut session = fresh();
         session.boot(&tokenized);
         assert!(session.snapshot().contains(ILLEGAL));
@@ -1503,6 +1516,83 @@ mod tests {
         );
         assert!(session.snapshot().lines().any(|line| line == "YES"));
         assert!(!session.snapshot().lines().any(|line| line == "NO"));
+    }
+
+    #[test]
+    fn save_load_files_peek_and_on_error() {
+        let dir = std::env::temp_dir().join("gwbasic-milestone3");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("HELLO.BAS");
+        let data = dir.join("note.txt");
+        let program_lit = program.display().to_string();
+        let data_lit = data.display().to_string();
+
+        let mut session = fresh();
+        session.type_ascii("10 PRINT \"Hello\"\n");
+        session.type_ascii(&format!("SAVE \"{program_lit}\"\n"));
+        session.type_ascii("NEW\n");
+        assert!(session.program_line(10).is_none());
+        session.type_ascii(&format!("LOAD \"{program_lit}\"\n"));
+        assert_eq!(session.program_line(10), Some("10 PRINT \"Hello\""));
+
+        session.type_ascii(&format!("SAVE \"{program_lit}\",P\n"));
+        session.type_ascii("NEW\n");
+        session.type_ascii(&format!("LOAD \"{program_lit}\"\n"));
+        assert!(session.program_line(10).unwrap().contains("Hello"));
+        session.type_ascii("LIST\n");
+        assert!(session.snapshot().contains(ILLEGAL));
+        session.type_ascii("RUN\n");
+        assert!(session.snapshot().lines().any(|line| line == "Hello"));
+
+        let mut files = fresh();
+        files.type_ascii(&format!("OPEN \"{data_lit}\" FOR OUTPUT AS #1\n"));
+        files.type_ascii("PRINT #1, \"Hello\"\n");
+        files.type_ascii("CLOSE #1\n");
+        files.type_ascii(&format!("OPEN \"{data_lit}\" FOR INPUT AS #1\n"));
+        files.type_ascii("LINE INPUT #1, A$\n");
+        files.type_ascii("PRINT A$\n");
+        let snap = files.snapshot();
+        assert!(
+            snap.lines().any(|line| line == "Hello"),
+            "file snapshot:\n{snap}"
+        );
+
+        let mut memory = fresh();
+        memory.type_ascii("POKE 100,65\nPRINT PEEK(100)\n");
+        assert!(memory.snapshot().lines().any(|line| line == " 65"));
+
+        let mut trapped = fresh();
+        trapped.type_ascii(
+            "10 ON ERROR GOTO 50\n20 ERROR 5\n30 PRINT \"NO\"\n40 END\n50 PRINT \"TRAP\"\n60 RESUME 40\nRUN\n",
+        );
+        assert!(trapped.snapshot().lines().any(|line| line == "TRAP"));
+        assert!(!trapped.snapshot().lines().any(|line| line == "NO"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wrapped_open_keeps_the_space_before_as() {
+        let path = std::env::temp_dir()
+            .join("gwbasic-milestone3")
+            .join("note.txt");
+        let line = format!("OPEN \"{}\" FOR OUTPUT AS #1", path.display());
+        let mut session = fresh();
+        for ch in line.chars() {
+            if let Some(byte) = crate::input::char_to_byte(ch) {
+                session.handle(Input::Char(byte));
+            }
+        }
+        assert_eq!(session.screen().logical_text(), line);
+        assert!(crate::basic::prepare(&line).is_ok());
+    }
+
+    #[test]
+    fn a_double_suffix_is_not_swallowed_by_the_file_mark() {
+        let mut session = fresh();
+        session.type_ascii("DEFINT A\nA#=1/2\nPRINT A#\n");
+        assert!(session.snapshot().lines().any(|line| line == " .5"));
     }
 
     #[test]

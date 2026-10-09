@@ -522,7 +522,7 @@ impl Screen {
         let mut occupied = if chars.is_empty() {
             1
         } else {
-            (chars.len() + self.width - 1) / self.width
+            chars.len().div_ceil(self.width)
         };
         if !chars.is_empty() && cursor_idx == chars.len() && chars.len() % self.width == 0 {
             occupied += 1;
@@ -537,10 +537,10 @@ impl Screen {
                 };
                 self.width
             ];
-            for c in 0..self.width {
+            for (c, cell) in cells.iter_mut().enumerate() {
                 let n = i * self.width + c;
                 if n < chars.len() {
-                    cells[c].ch = chars[n];
+                    cell.ch = chars[n];
                 }
             }
             logical_rows.push(Row {
@@ -734,6 +734,16 @@ mod tests {
         screen.set_cursor(0, 3);
         screen.erase_to_end();
         assert_eq!(screen.logical_text(), "ABC");
+    }
+
+    #[test]
+    fn a_space_in_the_last_column_stays_in_the_logical_line() {
+        let mut screen = Screen::new(80);
+        let mut text = "A".repeat(79);
+        text.push(' ');
+        text.push_str("BC");
+        type_str(&mut screen, &text);
+        assert_eq!(screen.logical_text(), text);
     }
 
     #[test]
