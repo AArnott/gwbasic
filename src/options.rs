@@ -1,7 +1,7 @@
 //! `gwbasic [filename] [/F:n] [/I] [/S:n] [/C:n] [/M:[n][,n]] [/D]`
 //!
 //! Switches follow chapter 2 of the User's Guide. Numbers may be decimal,
-//! `&H` hex, or `&O` octal. A filename means "load this program".
+//! `&H` hex, or `&O` octal. A filename means "load this program and run it".
 
 use std::path::PathBuf;
 
@@ -56,7 +56,7 @@ pub fn usage() -> &'static str {
     "\
 gwbasic [filename] [/F:n] [/I] [/S:n] [/C:n] [/M:n[,block]] [/D]
 
-  filename   program to load (.BAS assumed if omitted). ASCII, tokenized, or protected
+  filename   program to load and run (.BAS assumed if omitted). ASCII, tokenized, or protected
   /F:n       maximum open files (default 3, capped at 15)
   /I         accepted; the file table is sized by /F either way
   /S:n       random-file record length (default 128; random files are not implemented)

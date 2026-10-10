@@ -20,7 +20,7 @@ cargo run -- examples/hello.bas
 
 GitHub Actions runs those three checks on Ubuntu, macOS, and Windows. Ubuntu installs `pkg-config`, `libwayland-dev`, `libxkbcommon-dev`, and `libx11-dev` so winit can link.
 
-`cargo run -- examples/hello.bas` loads that ASCII program and prints the banner. `LIST` shows it. `RUN` executes it. At the `Ok` prompt, `PRINT "Hello"` prints `Hello` and then `Ok`. F3 types `LOAD"` and F4 types `SAVE"`.
+`cargo run -- examples/hello.bas` loads that ASCII program, prints the banner, and runs it. The screen shows `Hello from GW-BASIC`, then `LIST me, edit me, then SAVE me`, then `Ok`. `LIST` shows the program. At the `Ok` prompt, `PRINT "Hello"` prints `Hello` and then `Ok`. F3 types `LOAD"` and F4 types `SAVE"`.
 
 A filename with no extension is opened as `.BAS`. A missing file prints `File not found` and stays in the editor. A real tokenized (`FF`) or protected (`FE`) file loads. A corrupt one prints `Illegal function call`.
 

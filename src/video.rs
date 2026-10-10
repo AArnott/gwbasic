@@ -29,6 +29,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
     let mut session = Session::new();
     session.boot(&options);
+    if session.quit() {
+        return Ok(());
+    }
 
     let event_loop = EventLoop::new()?;
     let mut app = App {

@@ -92,6 +92,11 @@ impl Session {
         self.banner();
         if let Some(err) = load_error {
             self.error(&err);
+            return;
+        }
+        // Guide section 2.3: a filename proceeds as if RUN had been typed.
+        if options.program.is_some() {
+            self.cmd_run("");
         }
     }
 
@@ -1421,8 +1426,43 @@ mod tests {
         session.boot(&options);
         assert!(session.program_line(10).unwrap().contains("Hello"));
         assert!(session.snapshot().contains("GW-BASIC 3.23"));
+        assert!(session.snapshot().contains("Hello from GW-BASIC"));
+        assert!(session
+            .snapshot()
+            .contains("LIST me, edit me, then SAVE me"));
         assert!(!session.snapshot().contains("60300 Bytes free"));
         assert!(!session.quit());
+        assert!(!session.vm.is_running());
+
+        let dir = std::env::temp_dir().join("gwbasic-command-line");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stop = dir.join("STOP.BAS");
+        std::fs::write(&stop, "10 SYSTEM\n").unwrap();
+        let mut quit = fresh();
+        quit.boot(&Options {
+            program: Some(stop),
+            ..Options::default()
+        });
+        assert!(quit.quit());
+        assert_eq!(quit.program_line(10), Some("10 SYSTEM"));
+
+        let boom = dir.join("BOOM.BAS");
+        std::fs::write(&boom, "10 PRINT \"BOOT\"\n20 PRINT 1/0\n").unwrap();
+        let mut failed = fresh();
+        failed.boot(&Options {
+            program: Some(boom),
+            ..Options::default()
+        });
+        assert!(failed.snapshot().contains("BOOT"), "{}", failed.snapshot());
+        assert!(
+            failed.snapshot().contains("Division by zero in 20"),
+            "{}",
+            failed.snapshot()
+        );
+        assert_eq!(failed.program_line(10), Some("10 PRINT \"BOOT\""));
+        assert!(!failed.quit());
+        let _ = std::fs::remove_dir_all(&dir);
 
         let missing = Options {
             program: Some(std::path::PathBuf::from("no-such-gwbasic-program")),

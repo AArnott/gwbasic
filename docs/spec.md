@@ -22,7 +22,7 @@ The editor and the interpreter:
 - Logical lines, the editing keys below, and F1–F10.
 - Direct commands: `NEW`, `LIST`, `EDIT`, `DELETE`, `AUTO`, `SYSTEM`, `KEY`, `KEY ON`, `KEY OFF`, `KEY LIST`, `RUN`, `CONT`, `TRON`, `TROFF`, `WIDTH 40|80`, `CLS`, `REM`, and a leading `'`. `SCREEN` is an ordinary statement.
 - Numbered lines tokenized on Enter. `LIST` prints the detokenized source, so an edit after `LIST` round-trips. `?` is stored and listed as `PRINT`.
-- `RUN` executes from the first line, or from a line number. An empty program still prints `Ok`. A filename on the command line loads and does not run.
+- `RUN` executes from the first line, or from a line number. An empty program still prints `Ok`. A filename on the command line loads the program and runs it, as if `RUN` had been typed.
 - `PRINT`, `LPRINT`, `PRINT USING` (the common field forms), and `?`. Numbers are Microsoft Binary Format. A positive number prints with a leading space, and every number prints with a trailing space. A trailing `;` or `,` holds the cursor, so `PRINT "Hello";` is followed by `Ok` on the same line.
 - `LET` (optional), `GOTO`, `GOSUB`/`RETURN`, `IF`/`THEN`/`ELSE`, `FOR`/`NEXT`, `WHILE`/`WEND`, `ON n GOTO`/`GOSUB`, `END`, `STOP`, `CONT`, `TRON`/`TROFF`, and `REM`.
 - `CLS`, `LOCATE`, `COLOR`, `WIDTH`, and `BEEP`, plus the graphics statements in the Graphics section. Text `COLOR` and `LOCATE` remain.
@@ -69,7 +69,7 @@ gwbasic [filename] [/F:n] [/I] [/S:n] [/C:n] [/M:[n][,n]] [/D]
 
 Numbers may be decimal, `&H` hex, or `&O` octal. `/F` defaults to 3 and sizes the open-file table, capped at 15, whether or not `/I` is present. `/I` is accepted. `/S` defaults to 128 and is stored for random-file records, which are not implemented. `/C` is accepted and ignored until serial I/O exists. `/D` makes `SIN`, `COS`, `TAN`, `ATN`, `LOG`, `EXP`, and `SQR` return doubles. It does not change the banner. A second filename is an error.
 
-A filename with no extension gets `.BAS`. The file is loaded before the banner, so the free-space line includes it. A missing file stays in the editor and prints `File not found`. A file that starts with `FF` or `FE` is loaded as a tokenized or protected program. A truncated or otherwise illegal tokenized file prints `Illegal function call` and does not load. ASCII load skips a UTF-8 BOM and a trailing `1A`, and blank lines. Every other line must start with a line number.
+A filename with no extension gets `.BAS`. The file is loaded before the banner, so the free-space line includes it. After the banner, the program runs from the first line. A missing file stays in the editor and prints `File not found`. A file that starts with `FF` or `FE` is loaded as a tokenized or protected program. A truncated or otherwise illegal tokenized file prints `Illegal function call` and does not load. ASCII load skips a UTF-8 BOM and a trailing `1A`, and blank lines. Every other line must start with a line number.
 
 `SYSTEM` closes the window and does not print `Ok`.
 
