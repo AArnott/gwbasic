@@ -44,6 +44,27 @@ pub struct ColorArgs {
     pub extra: Option<i16>,
 }
 
+/// What `PAINT` writes into each filled pixel.
+#[derive(Clone, Debug)]
+pub enum Fill {
+    Solid(u8),
+    /// Tile bytes, one row per byte, repeating down the screen. At most 64 bytes.
+    Tile(Vec<u8>),
+}
+
+/// `CIRCLE` with the angles still carrying their signs. A negative angle draws
+/// a radius from the centre to that end of the arc.
+#[derive(Clone, Copy, Debug)]
+pub struct Circle {
+    pub cx: f64,
+    pub cy: f64,
+    pub radius: f64,
+    pub attr: u8,
+    pub start: Option<f64>,
+    pub end: Option<f64>,
+    pub aspect: Option<f64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
     pub ch: u8,
@@ -1117,6 +1138,379 @@ impl Gfx {
         }
         Ok(result)
     }
+
+    fn locate(&self, x: f64, y: f64) -> Result<(i32, i32), GfxErr> {
+        if !in_i16(x) || !in_i16(y) {
+            return Err(GfxErr::Overflow);
+        }
+        self.to_physical(x, y)
+    }
+
+    fn pixel_f(&self, lx: f64, ly: f64) -> (f64, f64) {
+        let (local_x, local_y) = self.logical_to_local(lx, ly);
+        (
+            f64::from(self.view_l) + local_x,
+            f64::from(self.view_t) + local_y,
+        )
+    }
+
+    fn logical_from_pixel(&self, px: f64, py: f64) -> (f64, f64) {
+        let vx = if self.view_relative {
+            px - f64::from(self.view_l)
+        } else {
+            px
+        };
+        let vy = if self.view_relative {
+            py - f64::from(self.view_t)
+        } else {
+            py
+        };
+        self.viewport_to_logical(vx, vy)
+    }
+
+    fn default_aspect(&self) -> f64 {
+        if self.pix_w == 0 {
+            return 1.0;
+        }
+        4.0 * self.pix_h as f64 / (3.0 * self.pix_w as f64)
+    }
+
+    fn axis_scale(&self) -> (f64, f64) {
+        let (vw, vh) = self.span();
+        let Some(window) = &self.window else {
+            return (1.0, 1.0);
+        };
+        let xs = (vw - 1.0) / (window.x1 - window.x0);
+        let ys = if window.screen {
+            (vh - 1.0) / (window.y1 - window.y0)
+        } else {
+            (vh - 1.0) / (window.y0 - window.y1)
+        };
+        (xs.abs(), ys.abs())
+    }
+
+    fn segment(&mut self, from: (i32, i32), to: (i32, i32), attr: u8, style: Option<u16>) {
+        let mut mask = style.unwrap_or(0xFFFF);
+        let styled = style.is_some();
+        walk_line(from.0, from.1, to.0, to.1, |x, y| {
+            let plot = !styled || mask & 0x8000 != 0;
+            if styled {
+                mask = mask.rotate_left(1);
+            }
+            if plot && self.in_view(x, y) {
+                self.put(x, y, attr);
+            }
+        });
+    }
+
+    fn box_outline(&mut self, a: (i32, i32), b: (i32, i32), attr: u8, style: Option<u16>) {
+        let (x0, y0) = a;
+        let (x1, y1) = b;
+        if x0 == x1 || y0 == y1 {
+            self.segment(a, b, attr, style);
+            return;
+        }
+        self.segment((x0, y0), (x1, y0), attr, style);
+        self.segment((x1, y0), (x1, y1), attr, style);
+        self.segment((x1, y1), (x0, y1), attr, style);
+        self.segment((x0, y1), (x0, y0), attr, style);
+    }
+
+    fn fill_rect(&mut self, a: (i32, i32), b: (i32, i32), attr: u8) {
+        let left = a.0.min(b.0).max(self.view_l);
+        let right = a.0.max(b.0).min(self.view_r);
+        let top = a.1.min(b.1).max(self.view_t);
+        let bottom = a.1.max(b.1).min(self.view_b);
+        if left > right || top > bottom {
+            return;
+        }
+        for y in top..=bottom {
+            for x in left..=right {
+                self.put(x, y, attr);
+            }
+        }
+    }
+
+    fn ellipse(&mut self, center: (i32, i32), radii: (i32, i32), arc: (f64, f64), attr: u8) {
+        let (cx, cy) = center;
+        let (rx, ry) = radii;
+        let (start, span) = arc;
+        let mut plot = |x: i32, y: i32| {
+            if on_arc(x - cx, y - cy, start, span) && self.in_view(x, y) {
+                self.put(x, y, attr);
+            }
+        };
+        if rx == 0 && ry == 0 {
+            if span >= std::f64::consts::TAU - 1e-6 {
+                plot(cx, cy);
+            }
+            return;
+        }
+        if rx == 0 {
+            for y in -ry..=ry {
+                plot(cx, cy + y);
+            }
+            return;
+        }
+        if ry == 0 {
+            for x in -rx..=rx {
+                plot(cx + x, cy);
+            }
+            return;
+        }
+        let rx = i64::from(rx);
+        let ry = i64::from(ry);
+        let rx2 = rx * rx;
+        let ry2 = ry * ry;
+        let tworx2 = 2 * rx2;
+        let twory2 = 2 * ry2;
+        let mut x = 0i64;
+        let mut y = ry;
+        let mut px = 0i64;
+        let mut py = tworx2 * y;
+        let mut p = ry2 - rx2 * ry + rx2 / 4;
+        while px < py {
+            plot_quad(cx, cy, x, y, &mut plot);
+            x += 1;
+            px += twory2;
+            if p < 0 {
+                p += ry2 + px;
+            } else {
+                y -= 1;
+                py -= tworx2;
+                p += ry2 + px - py;
+            }
+        }
+        p = ry2 * (x * x + x) + ry2 / 4 + rx2 * (y - 1) * (y - 1) - rx2 * ry2;
+        while y >= 0 {
+            plot_quad(cx, cy, x, y, &mut plot);
+            y -= 1;
+            py -= tworx2;
+            if p > 0 {
+                p += rx2 - py;
+            } else {
+                x += 1;
+                px += twory2;
+                p += rx2 - py + px;
+            }
+        }
+    }
+
+    fn spoke(&mut self, cx: i32, cy: i32, rx: i32, ry: i32, angle: f64, attr: u8) {
+        let ex = f64::from(cx) + f64::from(rx) * angle.cos();
+        let ey = f64::from(cy) - f64::from(ry) * angle.sin();
+        let Ok(ex) = round_px(ex) else {
+            return;
+        };
+        let Ok(ey) = round_px(ey) else {
+            return;
+        };
+        self.segment((cx, cy), (ex, ey), attr, None);
+    }
+
+    fn flood(
+        &mut self,
+        x: f64,
+        y: f64,
+        ink: FloodInk,
+        border: u8,
+        background: Option<Vec<u8>>,
+    ) -> Result<(), GfxErr> {
+        let (sx, sy) = self.locate(x, y)?;
+        if !self.in_view(sx, sy) {
+            return Ok(());
+        }
+        let border = self.clamp_attr(border);
+        if self.pixel_attr(sx, sy) == border {
+            return Ok(());
+        }
+        let mut seen = vec![false; self.pix_w.saturating_mul(self.pix_h)];
+        let mut stack = vec![(sx, sy)];
+        while let Some((mut x, y)) = stack.pop() {
+            while self.paintable(x - 1, y, border, &background, &seen) {
+                x -= 1;
+            }
+            let mut above = false;
+            let mut below = false;
+            while self.paintable(x, y, border, &background, &seen) {
+                let color = match &ink {
+                    FloodInk::Solid(color) => *color,
+                    FloodInk::Tile(tile) => self.tile_attr(tile, x, y),
+                };
+                self.put(x, y, color);
+                let index = self.pix_index(x, y);
+                if index < seen.len() {
+                    seen[index] = true;
+                }
+                above = self.queue_span((x, y - 1), border, &background, &seen, above, &mut stack);
+                below = self.queue_span((x, y + 1), border, &background, &seen, below, &mut stack);
+                x += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn paintable(
+        &self,
+        x: i32,
+        y: i32,
+        border: u8,
+        background: &Option<Vec<u8>>,
+        seen: &[bool],
+    ) -> bool {
+        if !self.in_view(x, y) {
+            return false;
+        }
+        let index = self.pix_index(x, y);
+        if index >= seen.len() || seen[index] {
+            return false;
+        }
+        let attr = self.pixel_attr(x, y);
+        if attr == border {
+            return false;
+        }
+        if let Some(tile) = background {
+            return attr == self.tile_attr(tile, x, y);
+        }
+        true
+    }
+
+    fn queue_span(
+        &self,
+        at: (i32, i32),
+        border: u8,
+        background: &Option<Vec<u8>>,
+        seen: &[bool],
+        in_span: bool,
+        stack: &mut Vec<(i32, i32)>,
+    ) -> bool {
+        let (x, y) = at;
+        if self.paintable(x, y, border, background, seen) {
+            if !in_span {
+                stack.push((x, y));
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn pix_index(&self, x: i32, y: i32) -> usize {
+        (y as usize) * self.pix_w + (x as usize)
+    }
+
+    fn pixel_attr(&self, x: i32, y: i32) -> u8 {
+        self.pixels[self.pix_index(x, y)]
+    }
+
+    fn tile_attr(&self, tile: &[u8], x: i32, y: i32) -> u8 {
+        if tile.is_empty() {
+            return 0;
+        }
+        let row = tile[(y as usize) % tile.len()];
+        let bpp = match self.palette.len() {
+            0..=2 => 1,
+            3..=4 => 2,
+            5..=16 => 4,
+            _ => 8,
+        };
+        let pixels_per_byte = 8 / bpp;
+        let slot = (x as usize) % pixels_per_byte;
+        let shift = 8 - bpp - slot * bpp;
+        let mask = (1u16 << bpp) - 1;
+        let attr = u16::from(row) >> shift & mask;
+        self.clamp_attr(attr as u8)
+    }
+}
+
+enum FloodInk {
+    Solid(u8),
+    Tile(Vec<u8>),
+}
+
+fn check_tile(bytes: &[u8]) -> Result<(), GfxErr> {
+    if bytes.is_empty() || bytes.len() > 64 {
+        Err(GfxErr::Illegal)
+    } else {
+        Ok(())
+    }
+}
+
+fn norm_angle(angle: f64) -> Result<(f64, bool), GfxErr> {
+    if !angle.is_finite() {
+        return Err(GfxErr::Overflow);
+    }
+    let spoke = angle < 0.0;
+    let magnitude = angle.abs();
+    let tau = std::f64::consts::TAU;
+    if magnitude > tau + 1.0e-3 {
+        return Err(GfxErr::Illegal);
+    }
+    Ok((magnitude.min(tau), spoke))
+}
+
+fn round_len(v: f64) -> Result<i32, GfxErr> {
+    if !v.is_finite() || v < 0.0 {
+        return Err(GfxErr::Overflow);
+    }
+    let rounded = (v + 0.5).floor();
+    if rounded > 32767.0 {
+        return Err(GfxErr::Overflow);
+    }
+    Ok(rounded as i32)
+}
+
+fn on_arc(dx: i32, dy: i32, start: f64, span: f64) -> bool {
+    let tau = std::f64::consts::TAU;
+    if span >= tau - 1.0e-6 {
+        return true;
+    }
+    if span <= 1.0e-9 {
+        return false;
+    }
+    let mut angle = (-f64::from(dy)).atan2(f64::from(dx));
+    if angle < 0.0 {
+        angle += tau;
+    }
+    let mut delta = angle - start;
+    if delta < 0.0 {
+        delta += tau;
+    }
+    delta <= span + 1.0e-6
+}
+
+fn plot_quad(cx: i32, cy: i32, x: i64, y: i64, plot: &mut impl FnMut(i32, i32)) {
+    let x = x as i32;
+    let y = y as i32;
+    plot(cx + x, cy + y);
+    plot(cx - x, cy + y);
+    plot(cx + x, cy - y);
+    plot(cx - x, cy - y);
+}
+
+fn walk_line(x0: i32, y0: i32, x1: i32, y1: i32, mut visit: impl FnMut(i32, i32)) {
+    let dx = (x1 - x0).abs();
+    let dy = (y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx - dy;
+    let mut x = x0;
+    let mut y = y0;
+    loop {
+        visit(x, y);
+        if x == x1 && y == y1 {
+            break;
+        }
+        let e2 = err * 2;
+        if e2 > -dy {
+            err -= dy;
+            x += sx;
+        }
+        if e2 < dx {
+            err += dx;
+            y += sy;
+        }
+    }
 }
 
 fn in_i16(v: f64) -> bool {
@@ -1538,6 +1932,170 @@ impl Screen {
         }
         Ok(())
     }
+
+    pub fn drawing_color(&self) -> u8 {
+        self.gfx.fg
+    }
+
+    pub fn set_drawing_color(&mut self, color: u8) -> Result<(), GfxErr> {
+        self.require_graphics()?;
+        self.gfx.fg = self.gfx.clamp_attr(color);
+        self.attr = self.gfx.fg;
+        Ok(())
+    }
+
+    pub fn pen(&self) -> (f64, f64) {
+        (self.gfx.pen_x, self.gfx.pen_y)
+    }
+
+    /// `filled` is `None` for a segment, `Some(false)` for a box outline, and
+    /// `Some(true)` for a filled box. `style` bits are used high-bit first.
+    pub fn line(
+        &mut self,
+        ends: [f64; 4],
+        attr: u8,
+        style: Option<u16>,
+        filled: Option<bool>,
+    ) -> Result<(), GfxErr> {
+        self.require_graphics()?;
+        let start = self.gfx.locate(ends[0], ends[1])?;
+        let end = self.gfx.locate(ends[2], ends[3])?;
+        let attr = self.gfx.clamp_attr(attr);
+        if filled == Some(true) {
+            self.gfx.fill_rect(start, end, attr);
+        } else if filled == Some(false) {
+            self.gfx.box_outline(start, end, attr, style);
+        } else {
+            self.gfx.segment(start, end, attr, style);
+        }
+        self.gfx.pen_x = ends[2];
+        self.gfx.pen_y = ends[3];
+        Ok(())
+    }
+
+    pub fn circle(&mut self, circle: Circle) -> Result<(), GfxErr> {
+        self.require_graphics()?;
+        if !circle.radius.is_finite() || circle.radius < 0.0 {
+            return Err(if circle.radius.is_finite() {
+                GfxErr::Illegal
+            } else {
+                GfxErr::Overflow
+            });
+        }
+        let (cx, cy) = self.gfx.locate(circle.cx, circle.cy)?;
+        let aspect = match circle.aspect {
+            None => self.gfx.default_aspect(),
+            Some(aspect) if aspect.is_finite() && aspect > 0.0 => aspect,
+            Some(aspect) if aspect.is_finite() => return Err(GfxErr::Illegal),
+            Some(_) => return Err(GfxErr::Overflow),
+        };
+        let (start, spoke_start) = match circle.start {
+            None => (0.0, false),
+            Some(angle) => norm_angle(angle)?,
+        };
+        let (end, spoke_end) = match circle.end {
+            None => (std::f64::consts::TAU, false),
+            Some(angle) => norm_angle(angle)?,
+        };
+        let full = circle.start.is_none() && circle.end.is_none();
+        let mut span = end - start;
+        if span < 0.0 {
+            span += std::f64::consts::TAU;
+        }
+        if full {
+            span = std::f64::consts::TAU;
+        }
+        let (x_scale, y_scale) = self.gfx.axis_scale();
+        let (x_aspect, y_aspect) = if aspect < 1.0 {
+            (1.0, aspect)
+        } else {
+            (1.0 / aspect, 1.0)
+        };
+        let rx = round_len(circle.radius * x_aspect * x_scale)?;
+        let ry = round_len(circle.radius * y_aspect * y_scale)?;
+        let attr = self.gfx.clamp_attr(circle.attr);
+        self.gfx.ellipse((cx, cy), (rx, ry), (start, span), attr);
+        if spoke_start {
+            self.gfx.spoke(cx, cy, rx, ry, start, attr);
+        }
+        if spoke_end {
+            self.gfx.spoke(cx, cy, rx, ry, end, attr);
+        }
+        self.gfx.pen_x = circle.cx;
+        self.gfx.pen_y = circle.cy;
+        Ok(())
+    }
+
+    pub fn paint_at(
+        &mut self,
+        x: f64,
+        y: f64,
+        fill: Fill,
+        border: Option<u8>,
+        background: Option<Vec<u8>>,
+    ) -> Result<(), GfxErr> {
+        self.require_graphics()?;
+        let tile = match &fill {
+            Fill::Solid(color) => {
+                let color = self.gfx.clamp_attr(*color);
+                let border = border.unwrap_or(color);
+                self.gfx.flood(x, y, FloodInk::Solid(color), border, None)?;
+                return Ok(());
+            }
+            Fill::Tile(bytes) => bytes.clone(),
+        };
+        check_tile(&tile)?;
+        if let Some(bytes) = &background {
+            check_tile(bytes)?;
+        }
+        let border = border.unwrap_or(self.gfx.fg);
+        self.gfx
+            .flood(x, y, FloodInk::Tile(tile), border, background)?;
+        Ok(())
+    }
+
+    /// Move the pen by a pixel delta. `draw` strokes the segment.
+    pub fn move_pen(&mut self, dx: f64, dy: f64, draw: bool) -> Result<(), GfxErr> {
+        self.require_graphics()?;
+        if !dx.is_finite() || !dy.is_finite() {
+            return Err(GfxErr::Overflow);
+        }
+        let (px, py) = self.gfx.pixel_f(self.gfx.pen_x, self.gfx.pen_y);
+        let nx = px + dx;
+        let ny = py + dy;
+        if draw {
+            let from = (round_px(px)?, round_px(py)?);
+            let to = (round_px(nx)?, round_px(ny)?);
+            self.gfx.segment(from, to, self.gfx.fg, None);
+        }
+        let (lx, ly) = self.gfx.logical_from_pixel(nx, ny);
+        if !lx.is_finite() || !ly.is_finite() {
+            return Err(GfxErr::Overflow);
+        }
+        self.gfx.pen_x = lx;
+        self.gfx.pen_y = ly;
+        Ok(())
+    }
+
+    pub fn move_pen_to(&mut self, x: f64, y: f64, draw: bool) -> Result<(), GfxErr> {
+        self.require_graphics()?;
+        let from = self.gfx.locate(self.gfx.pen_x, self.gfx.pen_y)?;
+        let to = self.gfx.locate(x, y)?;
+        if draw {
+            self.gfx.segment(from, to, self.gfx.fg, None);
+        }
+        self.gfx.pen_x = x;
+        self.gfx.pen_y = y;
+        Ok(())
+    }
+
+    fn require_graphics(&self) -> Result<(), GfxErr> {
+        if self.gfx.mode == 0 {
+            Err(GfxErr::Illegal)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1688,5 +2246,46 @@ mod tests {
         screen.set_window(true, 0.0, 0.0, 319.0, 199.0).unwrap();
         assert_eq!(screen.pmap(0.0, 1).unwrap(), 0.0);
         assert_eq!(screen.pmap(199.0, 1).unwrap(), 199.0);
+    }
+
+    #[test]
+    fn line_style_and_circle_cardinals() {
+        let mut screen = Screen::new(80);
+        screen
+            .apply_screen(ScreenArgs {
+                mode: Some(1),
+                burst: Some(0),
+                active: None,
+                visible: None,
+                erase: false,
+            })
+            .unwrap();
+        screen
+            .line([0.0, 0.0, 3.0, 0.0], 1, Some(0x8000), None)
+            .unwrap();
+        assert_eq!(screen.point_xy(0.0, 0.0).unwrap(), 1);
+        assert_eq!(screen.point_xy(1.0, 0.0).unwrap(), 0);
+        assert_eq!(screen.point_fn(0).unwrap().round(), 3.0);
+
+        screen
+            .circle(Circle {
+                cx: 160.0,
+                cy: 100.0,
+                radius: 10.0,
+                attr: 2,
+                start: None,
+                end: None,
+                aspect: Some(1.0),
+            })
+            .unwrap();
+        assert_eq!(screen.point_xy(170.0, 100.0).unwrap(), 2);
+        assert_eq!(screen.point_xy(150.0, 100.0).unwrap(), 2);
+        assert_eq!(screen.point_xy(160.0, 90.0).unwrap(), 2);
+        assert_eq!(screen.point_xy(160.0, 110.0).unwrap(), 2);
+        assert_eq!(screen.point_xy(160.0, 100.0).unwrap(), 0);
+        assert_eq!(screen.pen(), (160.0, 100.0));
+
+        screen.set_drawing_color(1).unwrap();
+        assert_eq!(screen.drawing_color(), 1);
     }
 }

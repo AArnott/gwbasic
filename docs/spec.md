@@ -46,7 +46,7 @@ The editor and the interpreter:
 - `COMMON name` and `COMMON name()` name the scalars and arrays that the next `CHAIN` keeps when `ALL` is absent. A scalar and an array of the same name are separate. The names are recorded when `COMMON` runs.
 - `INPUT$(n)` and `INPUT$(n,#file)` read `n` characters, with `n` from 1 to 255. From a file, those characters are raw bytes, including CR and LF. If fewer bytes remain, the result is `Input past end` and the file position stays put. From the keyboard, `INPUT$` does not echo. It waits until that many keys are waiting, then the statement runs again. Ctrl+Break and Ctrl+C during the wait stop the program the way they do at `INPUT`.
 
-Still `Illegal function call` at run time, after they tokenize: `CIRCLE`, `PAINT`, `DRAW`, `PLAY`, random files (`FIELD`, `GET`, `PUT`), `CALL`/`USR`, and device statements such as `OUT` and `WAIT`. A graphics `LINE` is a syntax error (`LINE INPUT` reads a line). `PALETTE USING`, `VIEW PRINT`, and `PCOPY` are not implemented. Serial, cassette, joystick, and light pen stay out.
+Still `Illegal function call` at run time, after they tokenize: `PLAY`, random files (`FIELD`, `GET`, `PUT`), `CALL`/`USR`, and device statements such as `OUT` and `WAIT`. `PALETTE USING`, `VIEW PRINT`, and `PCOPY` are not implemented. Serial, cassette, joystick, and light pen stay out.
 
 The window is winit and softbuffer, so the editor is the same program on Windows, Linux, and macOS. The tone uses `kernel32` `Beep` on Windows, `osascript beep` on macOS, and `paplay` of the freedesktop bell on Linux. A missing player is ignored. The unit tests never open a window and never play a tone.
 
@@ -120,7 +120,15 @@ Entering a graphics mode, or flipping color burst between zero and non-zero, cle
 
 `COLOR` in text mode is still a foreground and a background, each 0 to 15. In a graphics mode other than 1, 2, and 11, it sets the foreground. `SCREEN 1` sets the background and the CGA palette and leaves the foreground at 3. `SCREEN 2` and `SCREEN 11` reject `COLOR`. `PALETTE attribute,color` recolors one attribute, and existing pixels change with it. Color −1 leaves that entry alone. `PALETTE` alone restores the mode's palette. `PALETTE USING` is a syntax error.
 
-`CIRCLE`, `PAINT`, and `DRAW` tokenize and raise `Illegal function call`. A graphics `LINE` is a syntax error. `LINE INPUT` is unchanged.
+`LINE [[STEP](x1,y1)]-[STEP](x2,y2)[,[color][,[B|BF][,style]]]` draws a segment, a box outline (`B`), or a filled box (`BF`). The omitted start is the pen. `STEP` on the end is relative to the start, and the pen moves to that end even when the line is clipped. `style` is a 16-bit mask used high bit first; a 0 bit leaves the old pixel. `BF` together with `style` is a syntax error, so the line is not stored. A trailing comma is `Missing operand`. `LINE INPUT` is still the line-input statement.
+
+`CIRCLE [STEP](x,y),radius[,[color][,[start][,[end][,aspect]]]]` draws an ellipse and leaves the pen at the centre. The radius is in x units. An omitted aspect is `4 * pixel height / (3 * pixel width)`. Angles are radians, counterclockwise from the right, and must sit in 0 to 2π. A negative angle also draws that radius. A negative radius is `Illegal function call`.
+
+`PAINT [STEP](x,y)[,[paint][,[border][,background]]]` flood-fills from that point and does not move the pen. A seed outside the viewport, or already on the border, fills nothing. `paint` is a color or a tile string of 1 to 64 bytes, one row per byte. An omitted border is the paint color, or the foreground when the paint is a tile.
+
+`DRAW string` runs a graphics macro. `U` `D` `L` `R` `E` `F` `G` `H` step by the count (default 1). `B` moves without drawing and `N` draws and then returns. `M` with no sign on x is an absolute move; a leading sign makes it a relative step, scaled and turned. `S` is the scale in quarter steps (default 4, range 0 to 255). `A` is 0 to 3 quarter-turns and `TA` is degrees from −360 to 360. `C` sets the foreground. `P paint,border` fills at the pen. `X variable;` runs a string, at most 32 deep. Scale and heading last until the next `DRAW` changes them. An empty string does nothing. In text mode a non-empty `DRAW` is `Illegal function call` at run time, and the line stays stored.
+
+`GET`, `PUT`, and `PCOPY` are not implemented.
 
 The window scales the pixel buffer into the letterbox, then draws the text glyphs over it. Spaces are left transparent. `POINT` reads the pixel buffer, not the glyphs. The unit tests do not open a window.
 

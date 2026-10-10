@@ -542,6 +542,7 @@ impl Session {
                 self.emit_str(&format!("{}^\n", " ".repeat(column)));
                 let message = match fault.kind {
                     FaultKind::Overflow => "Overflow",
+                    FaultKind::Missing => "Missing operand",
                     FaultKind::Syntax => SYNTAX,
                 };
                 self.error(message);
@@ -559,6 +560,7 @@ impl Session {
                 self.emit_str(&format!("{}^\n", " ".repeat(fault.column)));
                 let message = match fault.kind {
                     FaultKind::Overflow => "Overflow",
+                    FaultKind::Missing => "Missing operand",
                     FaultKind::Syntax => SYNTAX,
                 };
                 self.error(message);
@@ -2239,6 +2241,331 @@ mod tests {
             clamped.snapshot().contains(ILLEGAL),
             "{}",
             clamped.snapshot()
+        );
+    }
+
+    #[test]
+    fn line_draws_segments_boxes_and_styles() {
+        let mut segment = fresh();
+        segment.type_ascii(
+            "10 SCREEN 1\n\
+             20 LINE (0,0)-(10,0),1\n\
+             30 PRINT POINT(0,0);POINT(10,0);POINT(5,0);POINT(0,1)\n\
+             40 PRINT POINT(0)\n\
+             RUN\n",
+        );
+        assert_eq!(segment.snapshot(), " 1  1  1  0\n 10\nOk");
+
+        let mut continued = fresh();
+        continued.type_ascii(
+            "10 SCREEN 1\n\
+             20 PSET(0,0),1\n\
+             30 LINE -(5,0)\n\
+             40 PRINT POINT(5,0);POINT(0,0);POINT(0)\n\
+             RUN\n",
+        );
+        assert_eq!(continued.snapshot(), " 3  3  5\nOk");
+
+        let mut stepped = fresh();
+        stepped.type_ascii(
+            "10 SCREEN 1\n\
+             20 PSET(0,0),1\n\
+             30 LINE -STEP(5,0)\n\
+             40 PRINT POINT(0);POINT(1)\n\
+             RUN\n",
+        );
+        assert_eq!(stepped.snapshot(), " 5  0\nOk");
+
+        let mut outline = fresh();
+        outline.type_ascii(
+            "10 SCREEN 1\n\
+             20 LINE (0,0)-(4,2),1,B\n\
+             30 PRINT POINT(2,1);POINT(0,0)\n\
+             RUN\n",
+        );
+        assert_eq!(outline.snapshot(), " 0  1\nOk");
+
+        let mut filled = fresh();
+        filled.type_ascii(
+            "10 SCREEN 1\n\
+             20 LINE (0,0)-(4,2),1,BF\n\
+             30 PRINT POINT(2,1);POINT(5,1)\n\
+             RUN\n",
+        );
+        assert_eq!(filled.snapshot(), " 1  0\nOk");
+
+        let mut high = fresh();
+        high.type_ascii(
+            "10 SCREEN 1\n\
+             20 LINE (0,0)-(3,0),1,,&H8000\n\
+             30 PRINT POINT(0,0);POINT(1,0)\n\
+             RUN\n",
+        );
+        assert_eq!(high.snapshot(), " 1  0\nOk");
+
+        let mut mask = fresh();
+        mask.type_ascii(
+            "10 SCREEN 1\n\
+             20 LINE (0,0)-(3,0),1,,&HA000\n\
+             30 PRINT POINT(0,0);POINT(1,0);POINT(2,0);POINT(3,0)\n\
+             RUN\n",
+        );
+        assert_eq!(mask.snapshot(), " 1  0  1  0\nOk");
+
+        let mut styled = fresh();
+        styled.type_ascii("10 LINE (0,0)-(2,2),,BF,&HFFFF\n");
+        assert!(styled.program_line(10).is_none());
+        assert!(styled.snapshot().contains(SYNTAX), "{}", styled.snapshot());
+
+        let mut text = fresh();
+        text.type_ascii("10 LINE (0,0)-(1,1)\nRUN\n");
+        assert!(text.program_line(10).is_some());
+        assert!(text.snapshot().contains("Illegal function call in 10"));
+
+        let mut trailing = fresh();
+        trailing.type_ascii("10 LINE (0,0)-(1,1),\n");
+        assert!(trailing.program_line(10).is_none());
+        assert!(
+            trailing.snapshot().contains("Missing operand"),
+            "{}",
+            trailing.snapshot()
+        );
+    }
+
+    #[test]
+    fn circle_draws_arcs_and_spokes() {
+        let mut full = fresh();
+        full.type_ascii(
+            "10 SCREEN 1\n\
+             20 CIRCLE (160,100),10,1,,,1\n\
+             30 PRINT POINT(170,100);POINT(150,100);POINT(160,90);POINT(160,110);POINT(160,100)\n\
+             40 PRINT POINT(0);POINT(1)\n\
+             RUN\n",
+        );
+        assert_eq!(full.snapshot(), " 1  1  1  1  0\n 160  100\nOk");
+
+        let mut arc = fresh();
+        arc.type_ascii(
+            "10 SCREEN 1\n\
+             20 CIRCLE (160,100),10,1,0,1.5708,1\n\
+             30 PRINT POINT(170,100);POINT(160,90);POINT(150,100);POINT(160,110)\n\
+             RUN\n",
+        );
+        assert_eq!(arc.snapshot(), " 1  1  0  0\nOk");
+
+        let mut spoke = fresh();
+        spoke.type_ascii(
+            "10 SCREEN 1\n\
+             20 CIRCLE (160,100),10,1,0,-1.5708,1\n\
+             30 PRINT POINT(160,100);POINT(170,100);POINT(160,90);POINT(150,100)\n\
+             RUN\n",
+        );
+        assert_eq!(spoke.snapshot(), " 1  1  1  0\nOk");
+
+        let mut negative = fresh();
+        negative.type_ascii("10 SCREEN 1\n20 CIRCLE (10,10),-1\nRUN\n");
+        assert!(negative.snapshot().contains("Illegal function call in 20"));
+
+        let mut text = fresh();
+        text.type_ascii("10 CIRCLE (0,0),10\nRUN\n");
+        assert!(text.program_line(10).is_some());
+        assert!(text.snapshot().contains("Illegal function call in 10"));
+
+        let mut trailing = fresh();
+        trailing.type_ascii("10 CIRCLE (0,0),10,\n");
+        assert!(trailing.program_line(10).is_none());
+        assert!(
+            trailing.snapshot().contains("Missing operand"),
+            "{}",
+            trailing.snapshot()
+        );
+    }
+
+    #[test]
+    fn paint_fills_regions_and_tiles() {
+        let mut solid = fresh();
+        solid.type_ascii(
+            "10 SCREEN 1\n\
+             20 LINE (10,10)-(20,20),1,B\n\
+             30 PAINT (15,15),2,1\n\
+             40 PRINT POINT(15,15);POINT(10,10);POINT(9,15)\n\
+             RUN\n",
+        );
+        assert_eq!(solid.snapshot(), " 2  1  0\nOk");
+
+        let mut border = fresh();
+        border.type_ascii(
+            "10 SCREEN 1\n\
+             20 LINE (10,10)-(20,20),1,B\n\
+             30 PAINT (10,10),2,1\n\
+             40 PRINT POINT(15,15);POINT(10,10)\n\
+             RUN\n",
+        );
+        assert_eq!(border.snapshot(), " 0  1\nOk");
+
+        let mut outside = fresh();
+        outside.type_ascii(
+            "10 SCREEN 1\n\
+             20 LINE (10,10)-(20,20),1,B\n\
+             30 PAINT (-1,-1),2,1\n\
+             40 PRINT POINT(15,15)\n\
+             RUN\n",
+        );
+        assert_eq!(outside.snapshot(), " 0\nOk");
+
+        let mut tile = fresh();
+        tile.type_ascii(
+            "10 SCREEN 2\n\
+             20 LINE (0,0)-(8,8),1,B\n\
+             30 PAINT (4,4),CHR$(255),1\n\
+             40 PRINT POINT(4,4);POINT(0,0);POINT(9,4)\n\
+             RUN\n",
+        );
+        assert_eq!(tile.snapshot(), " 1  1  0\nOk");
+
+        let mut empty = fresh();
+        empty.type_ascii("10 SCREEN 2\n20 PAINT (1,1),\"\"\nRUN\n");
+        assert!(empty.snapshot().contains("Illegal function call in 20"));
+
+        let mut long = fresh();
+        long.type_ascii("10 SCREEN 2\n20 PAINT (1,1),STRING$(65,\"A\")\nRUN\n");
+        assert!(long.snapshot().contains("Illegal function call in 20"));
+    }
+
+    #[test]
+    fn draw_runs_the_macro_language() {
+        let mut right = fresh();
+        right.type_ascii(
+            "10 SCREEN 12\n\
+             20 DRAW \"BM0,0C1R10\"\n\
+             30 PRINT POINT(10,0);POINT(0,0);POINT(0)\n\
+             RUN\n",
+        );
+        assert_eq!(right.snapshot(), " 1  1  10\nOk");
+
+        let mut blank = fresh();
+        blank.type_ascii(
+            "10 SCREEN 12\n\
+             20 DRAW \"BM100,100BU10\"\n\
+             30 PRINT POINT(100,90);POINT(0);POINT(1)\n\
+             RUN\n",
+        );
+        assert_eq!(blank.snapshot(), " 0  100  90\nOk");
+
+        let mut back = fresh();
+        back.type_ascii(
+            "10 SCREEN 12\n\
+             20 DRAW \"BM100,100C1NU10\"\n\
+             30 PRINT POINT(100,90);POINT(0);POINT(1)\n\
+             RUN\n",
+        );
+        assert_eq!(back.snapshot(), " 1  100  100\nOk");
+
+        let mut scaled = fresh();
+        scaled.type_ascii(
+            "10 SCREEN 12\n\
+             20 DRAW \"BM0,0C1S8R4\"\n\
+             30 PRINT POINT(8,0);POINT(0)\n\
+             RUN\n",
+        );
+        assert_eq!(scaled.snapshot(), " 1  8\nOk");
+
+        let mut turned = fresh();
+        turned.type_ascii(
+            "10 SCREEN 12\n\
+             20 DRAW \"BM100,100C1A1R10\"\n\
+             30 PRINT POINT(100,90);POINT(110,100);POINT(0);POINT(1)\n\
+             RUN\n",
+        );
+        assert_eq!(turned.snapshot(), " 1  0  100  90\nOk");
+
+        let mut angled = fresh();
+        angled.type_ascii(
+            "10 SCREEN 12\n\
+             20 DRAW \"BM100,100C1TA90R10\"\n\
+             30 PRINT POINT(100,90);POINT(0);POINT(1)\n\
+             RUN\n",
+        );
+        assert_eq!(angled.snapshot(), " 1  100  90\nOk");
+
+        let mut filled = fresh();
+        filled.type_ascii(
+            "10 SCREEN 12\n\
+             20 LINE (10,10)-(20,20),1,B\n\
+             30 DRAW \"BM15,15P2,1\"\n\
+             40 PRINT POINT(15,15);POINT(10,10);POINT(9,15)\n\
+             RUN\n",
+        );
+        assert_eq!(filled.snapshot(), " 2  1  0\nOk");
+
+        let mut nested = fresh();
+        nested.type_ascii(
+            "10 SCREEN 12\n\
+             20 A$=\"BM10,10C1R4\"\n\
+             30 DRAW \"XA$;\"\n\
+             40 PRINT POINT(14,10);POINT(10,10);POINT(0)\n\
+             RUN\n",
+        );
+        assert_eq!(nested.snapshot(), " 1  1  14\nOk");
+
+        let mut variable = fresh();
+        variable.type_ascii(
+            "10 SCREEN 12\n\
+             20 A%=3\n\
+             30 DRAW \"BM0,0C1R=A%;\"\n\
+             40 PRINT POINT(3,0);POINT(0)\n\
+             RUN\n",
+        );
+        assert_eq!(variable.snapshot(), " 1  3\nOk");
+
+        let mut relative = fresh();
+        relative.type_ascii(
+            "10 SCREEN 12\n\
+             20 DRAW \"BM0,0C1M+5,0\"\n\
+             30 PRINT POINT(5,0);POINT(0)\n\
+             RUN\n",
+        );
+        assert_eq!(relative.snapshot(), " 1  5\nOk");
+
+        let mut bad = fresh();
+        bad.type_ascii("10 SCREEN 12\n20 DRAW \"Z\"\nRUN\n");
+        assert!(bad.snapshot().contains("Illegal function call in 20"));
+
+        let mut partial = fresh();
+        partial.type_ascii("SCREEN 12\nDRAW \"BM0,0C1R4Z\"\nPRINT POINT(4,0)\n");
+        assert!(
+            partial.snapshot().contains(ILLEGAL),
+            "{}",
+            partial.snapshot()
+        );
+        has_line(&partial, " 1");
+
+        let mut text = fresh();
+        text.type_ascii("10 DRAW \"R1\"\nRUN\n");
+        assert!(text.program_line(10).is_some());
+        assert!(text.snapshot().contains("Illegal function call in 10"));
+
+        let mut missing = fresh();
+        missing.type_ascii("10 DRAW\n");
+        assert!(missing.program_line(10).is_none());
+        assert!(
+            missing.snapshot().contains("Missing operand"),
+            "{}",
+            missing.snapshot()
+        );
+
+        let mut deep = fresh();
+        deep.type_ascii(
+            "10 SCREEN 12\n\
+             20 A$=\"XB$;\"\n\
+             30 B$=\"XA$;\"\n\
+             40 DRAW \"XA$;\"\n\
+             RUN\n",
+        );
+        assert!(
+            deep.snapshot().contains("Illegal function call in 40"),
+            "{}",
+            deep.snapshot()
         );
     }
 }

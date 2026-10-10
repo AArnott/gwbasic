@@ -6,7 +6,7 @@ use crate::crunch::{self, Tok};
 use crate::files::{self, Files, SaveKind, SeqMode};
 use crate::mbf::{MathError, Mbf};
 use crate::program::Program;
-use crate::screen::Screen;
+use crate::screen::{Circle, Fill, Screen};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 pub const SYNTAX: &str = "Syntax error";
@@ -379,6 +379,10 @@ pub struct Vm {
     common: Vec<CommonItem>,
     /// Characters `INPUT$` still needs from the keyboard.
     wait_keys: Option<u16>,
+    /// `DRAW` scale. 4 is one pixel per step. `S` stores 0 to 255.
+    draw_scale: u8,
+    /// `DRAW` heading in degrees. 0 faces right. Positive turns counterclockwise.
+    draw_degrees: f64,
 }
 
 pub struct Host<'a> {
@@ -451,6 +455,8 @@ impl Vm {
             environ: std::env::vars().collect(),
             common: Vec::new(),
             wait_keys: None,
+            draw_scale: 4,
+            draw_degrees: 0.0,
         }
     }
 
@@ -598,15 +604,25 @@ pub fn store_source_line(
 pub fn prepare(source: &str) -> Result<Vec<u8>, crate::crunch::Fault> {
     let tokens = crunch::crunch(source)?;
     if let Err(err) = check(&tokens) {
+        let kind = if err.code == 22 {
+            crate::crunch::FaultKind::Missing
+        } else {
+            crate::crunch::FaultKind::Syntax
+        };
         return Err(crate::crunch::Fault {
-            kind: crate::crunch::FaultKind::Syntax,
-            column: err,
+            kind,
+            column: err.column,
         });
     }
     Ok(tokens)
 }
 
-pub fn check(tokens: &[u8]) -> Result<(), usize> {
+struct CheckFail {
+    column: usize,
+    code: i16,
+}
+
+fn check(tokens: &[u8]) -> Result<(), CheckFail> {
     let mut parser = Parser::new(tokens, 0);
     while !matches!(parser.cur, Tok::End) {
         if matches!(parser.cur, Tok::Colon) {
@@ -614,9 +630,15 @@ pub fn check(tokens: &[u8]) -> Result<(), usize> {
             continue;
         }
         if parser.cur.is("ELSE") {
-            return Err(parser.at);
+            return Err(CheckFail {
+                column: parser.at,
+                code: 2,
+            });
         }
-        walk(&mut parser, Mode::Check, None).map_err(|_| parser.at)?;
+        walk(&mut parser, Mode::Check, None).map_err(|err| CheckFail {
+            column: parser.at,
+            code: err.code,
+        })?;
     }
     Ok(())
 }
@@ -1131,10 +1153,11 @@ fn walk(
         "RESUME" => exec_resume(parser, mode, ctx.as_mut()),
         "LINE" => {
             parser.bump();
-            if !parser.cur.is("INPUT") {
-                return Err(fault(SYNTAX, 2));
+            if parser.cur.is("INPUT") {
+                exec_input(parser, mode, ctx.as_mut(), true)
+            } else {
+                exec_graphics_line(parser, mode, ctx.as_mut())
             }
-            exec_input(parser, mode, ctx.as_mut(), true)
         }
         "READ" => exec_read(parser, mode, ctx.as_mut()),
         "RESTORE" => exec_restore(parser, mode, ctx.as_mut()),
@@ -1223,8 +1246,11 @@ fn walk(
         "VIEW" => exec_view(parser, mode, ctx.as_mut()),
         "WINDOW" => exec_window(parser, mode, ctx.as_mut()),
         "PALETTE" => exec_palette(parser, mode, ctx.as_mut()),
-        "CALL" | "OUT" | "WAIT" | "PLAY" | "DRAW" | "CIRCLE" | "PAINT" | "KEY" | "EDIT"
-        | "DELETE" | "AUTO" | "FIELD" | "GET" | "PUT" => {
+        "CIRCLE" => exec_circle(parser, mode, ctx.as_mut()),
+        "PAINT" => exec_paint(parser, mode, ctx.as_mut()),
+        "DRAW" => exec_draw(parser, mode, ctx.as_mut()),
+        "CALL" | "OUT" | "WAIT" | "PLAY" | "KEY" | "EDIT" | "DELETE" | "AUTO" | "FIELD" | "GET"
+        | "PUT" => {
             // Recognized, not part of this milestone. Skip the rest of the statement.
             parser.bump();
             skip_statement(parser);
@@ -3838,6 +3864,721 @@ fn exec_palette(
     Ok(Flow::Next)
 }
 
+/// Comma-separated optional expressions. A comma with nothing after it is
+/// `Missing operand`. An empty slot between commas is `None`.
+fn tail_slots(parser: &mut Parser<'_>, max: usize) -> Result<Vec<Option<Expr>>, RunErr> {
+    let mut slots = Vec::new();
+    while matches!(parser.cur, Tok::Punct(b',')) {
+        parser.bump();
+        if terminated(&parser.cur) {
+            return Err(fault(MISSING, 22));
+        }
+        if slots.len() == max {
+            return Err(fault(SYNTAX, 2));
+        }
+        if matches!(parser.cur, Tok::Punct(b',')) {
+            slots.push(None);
+            continue;
+        }
+        slots.push(Some(parse_expr(parser)?));
+    }
+    Ok(slots)
+}
+
+struct StepPoint {
+    step: bool,
+    x: Expr,
+    y: Expr,
+}
+
+fn parse_step_point(parser: &mut Parser<'_>) -> Result<StepPoint, RunErr> {
+    let step = if parser.cur.is("STEP") {
+        parser.bump();
+        true
+    } else {
+        false
+    };
+    expect_punct(parser, b'(')?;
+    let x = parse_expr(parser)?;
+    expect_punct(parser, b',')?;
+    let y = parse_expr(parser)?;
+    expect_punct(parser, b')')?;
+    Ok(StepPoint { step, x, y })
+}
+
+fn eval_step_point(
+    vm: &mut Vm,
+    host: &mut Host<'_>,
+    point: &StepPoint,
+    origin: (f64, f64),
+) -> Result<(f64, f64), RunErr> {
+    let x = coord_of(&eval_expr(vm, host, &point.x)?)?;
+    let y = coord_of(&eval_expr(vm, host, &point.y)?)?;
+    if point.step {
+        Ok((origin.0 + x, origin.1 + y))
+    } else {
+        Ok((x, y))
+    }
+}
+
+fn optional_coord(
+    vm: &mut Vm,
+    host: &mut Host<'_>,
+    slot: Option<&Expr>,
+) -> Result<Option<f64>, RunErr> {
+    match slot {
+        None => Ok(None),
+        Some(expr) => Ok(Some(coord_of(&eval_expr(vm, host, expr)?)?)),
+    }
+}
+
+fn parse_box_flag(parser: &mut Parser<'_>) -> Result<bool, RunErr> {
+    let name = match &parser.cur {
+        Tok::Ident(name) => name.clone(),
+        _ => return Err(fault(SYNTAX, 2)),
+    };
+    parser.bump();
+    match name.as_str() {
+        "B" => Ok(false),
+        "BF" => Ok(true),
+        _ => Err(fault(SYNTAX, 2)),
+    }
+}
+
+struct LineTail {
+    color: Option<Expr>,
+    /// `None` is a segment, `Some(false)` is `B`, and `Some(true)` is `BF`.
+    filled: Option<bool>,
+    style: Option<Expr>,
+}
+
+/// Color, then `B`/`BF`, then the style mask. `BF` with a style is a syntax
+/// error. A comma that ends the statement is `Missing operand`.
+fn parse_line_tail(parser: &mut Parser<'_>) -> Result<LineTail, RunErr> {
+    if !matches!(parser.cur, Tok::Punct(b',')) {
+        return Ok(LineTail {
+            color: None,
+            filled: None,
+            style: None,
+        });
+    }
+    parser.bump();
+    if terminated(&parser.cur) {
+        return Err(fault(MISSING, 22));
+    }
+    let color = if matches!(parser.cur, Tok::Punct(b',')) {
+        None
+    } else {
+        Some(parse_expr(parser)?)
+    };
+    if !matches!(parser.cur, Tok::Punct(b',')) {
+        return Ok(LineTail {
+            color,
+            filled: None,
+            style: None,
+        });
+    }
+    parser.bump();
+    if terminated(&parser.cur) {
+        return Err(fault(MISSING, 22));
+    }
+    let filled = if matches!(parser.cur, Tok::Punct(b',')) {
+        None
+    } else {
+        Some(parse_box_flag(parser)?)
+    };
+    if !matches!(parser.cur, Tok::Punct(b',')) {
+        return Ok(LineTail {
+            color,
+            filled,
+            style: None,
+        });
+    }
+    parser.bump();
+    if terminated(&parser.cur) {
+        return Err(fault(MISSING, 22));
+    }
+    if filled == Some(true) {
+        return Err(fault(SYNTAX, 2));
+    }
+    let style = Some(parse_expr(parser)?);
+    if matches!(parser.cur, Tok::Punct(b',')) {
+        return Err(fault(MISSING, 22));
+    }
+    Ok(LineTail {
+        color,
+        filled,
+        style,
+    })
+}
+
+fn exec_graphics_line(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    let start = if is_dash(&parser.cur) {
+        None
+    } else {
+        Some(parse_step_point(parser)?)
+    };
+    if !is_dash(&parser.cur) {
+        return Err(fault(SYNTAX, 2));
+    }
+    parser.bump();
+    let end = parse_step_point(parser)?;
+    let tail = parse_line_tail(parser)?;
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let origin = ctx.1.screen.pen();
+    let (x0, y0) = match &start {
+        None => origin,
+        Some(point) => eval_step_point(ctx.0, ctx.1, point, origin)?,
+    };
+    let (x1, y1) = eval_step_point(ctx.0, ctx.1, &end, (x0, y0))?;
+    let attr = match &tail.color {
+        Some(expr) => eval_attr(ctx.0, ctx.1, expr)?,
+        None => ctx.1.screen.drawing_color(),
+    };
+    let style = match &tail.style {
+        Some(expr) => Some(cint_value(&eval_expr(ctx.0, ctx.1, expr)?)? as u16),
+        None => None,
+    };
+    ctx.1
+        .screen
+        .line([x0, y0, x1, y1], attr, style, tail.filled)
+        .map_err(gfx_fault)?;
+    Ok(Flow::Next)
+}
+
+fn exec_circle(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let center = parse_step_point(parser)?;
+    expect_punct(parser, b',')?;
+    let radius = parse_expr(parser)?;
+    let slots = tail_slots(parser, 4)?;
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let origin = ctx.1.screen.pen();
+    let (cx, cy) = eval_step_point(ctx.0, ctx.1, &center, origin)?;
+    let radius = coord_of(&eval_expr(ctx.0, ctx.1, &radius)?)?;
+    let attr = match slot_expr(&slots, 0) {
+        Some(expr) => eval_attr(ctx.0, ctx.1, expr)?,
+        None => ctx.1.screen.drawing_color(),
+    };
+    let start = optional_coord(ctx.0, ctx.1, slot_expr(&slots, 1))?;
+    let end = optional_coord(ctx.0, ctx.1, slot_expr(&slots, 2))?;
+    let aspect = optional_coord(ctx.0, ctx.1, slot_expr(&slots, 3))?;
+    ctx.1
+        .screen
+        .circle(Circle {
+            cx,
+            cy,
+            radius,
+            attr,
+            start,
+            end,
+            aspect,
+        })
+        .map_err(gfx_fault)?;
+    Ok(Flow::Next)
+}
+
+fn eval_fill(vm: &mut Vm, host: &mut Host<'_>, slot: Option<&Expr>) -> Result<Fill, RunErr> {
+    let Some(expr) = slot else {
+        return Ok(Fill::Solid(host.screen.drawing_color()));
+    };
+    let value = eval_expr(vm, host, expr)?;
+    if value.ty() == Ty::Str {
+        return Ok(Fill::Tile(string_bytes(&value)?));
+    }
+    let n = cint_value(&value)?;
+    if !(0..=255).contains(&n) {
+        return Err(fault(ILLEGAL, 5));
+    }
+    Ok(Fill::Solid(n as u8))
+}
+
+fn exec_paint(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    let point = parse_step_point(parser)?;
+    let slots = tail_slots(parser, 3)?;
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let origin = ctx.1.screen.pen();
+    let (x, y) = eval_step_point(ctx.0, ctx.1, &point, origin)?;
+    let fill = eval_fill(ctx.0, ctx.1, slot_expr(&slots, 0))?;
+    let border = match slot_expr(&slots, 1) {
+        Some(expr) => Some(eval_attr(ctx.0, ctx.1, expr)?),
+        None => None,
+    };
+    let background = match slot_expr(&slots, 2) {
+        Some(expr) => Some(string_bytes(&eval_expr(ctx.0, ctx.1, expr)?)?),
+        None => None,
+    };
+    ctx.1
+        .screen
+        .paint_at(x, y, fill, border, background)
+        .map_err(gfx_fault)?;
+    Ok(Flow::Next)
+}
+
+fn exec_draw(
+    parser: &mut Parser<'_>,
+    mode: Mode,
+    ctx: Option<&mut (&mut Vm, &mut Host<'_>)>,
+) -> Result<Flow, RunErr> {
+    parser.bump();
+    if terminated(&parser.cur) {
+        return Err(fault(MISSING, 22));
+    }
+    let expr = parse_expr(parser)?;
+    if mode == Mode::Check {
+        return Ok(Flow::Next);
+    }
+    let ctx = ctx.ok_or_else(|| fault(SYNTAX, 2))?;
+    let text = need_str(&eval_expr(ctx.0, ctx.1, &expr)?)?;
+    if text.is_empty() {
+        return Ok(Flow::Next);
+    }
+    if ctx.1.screen.graphics_mode() == 0 {
+        return Err(fault(ILLEGAL, 5));
+    }
+    draw_gml(ctx.0, ctx.1, &text, 0)?;
+    Ok(Flow::Next)
+}
+
+const DRAW_DEPTH: u32 = 32;
+
+fn draw_gml(vm: &mut Vm, host: &mut Host<'_>, text: &str, depth: u32) -> Result<(), RunErr> {
+    if depth >= DRAW_DEPTH {
+        return Err(fault(ILLEGAL, 5));
+    }
+    let mut gml = Gml {
+        chars: text.chars().collect(),
+        i: 0,
+    };
+    gml.run(vm, host, depth)
+}
+
+fn draw_aspect(screen: &Screen) -> f64 {
+    let (width, height) = screen.pixel_size();
+    if width == 0 {
+        1.0
+    } else {
+        4.0 * height as f64 / (3.0 * width as f64)
+    }
+}
+
+/// `(sin, cos)` of a heading. Quarter turns use exact values so `A1` does not
+/// drift off the axis.
+fn heading_sin_cos(degrees: f64) -> (f64, f64) {
+    let turns = degrees / 90.0;
+    let nearest = turns.round();
+    if (turns - nearest).abs() < 1e-6 {
+        match nearest.rem_euclid(4.0) as i32 {
+            0 => (0.0, 1.0),
+            1 => (1.0, 0.0),
+            2 => (0.0, -1.0),
+            _ => (-1.0, 0.0),
+        }
+    } else {
+        let theta = degrees.to_radians();
+        (theta.sin(), theta.cos())
+    }
+}
+
+fn step_count(n: i32) -> Result<i32, RunErr> {
+    match n.checked_abs() {
+        Some(abs) if abs <= 32767 => Ok(n),
+        _ => Err(fault(OVERFLOW, 6)),
+    }
+}
+
+fn gml_value(vm: &mut Vm, ident: &Ident, idx: &[i16]) -> Result<Value, RunErr> {
+    let name = ident.resolve(&vm.defs);
+    if idx.is_empty() {
+        Ok(load_var(vm, &name))
+    } else {
+        load_elem(vm, &name, idx)
+    }
+}
+
+fn stroke(
+    vm: &Vm,
+    host: &mut Host<'_>,
+    step: (f64, f64),
+    draw: bool,
+    saved: Option<(f64, f64)>,
+) -> Result<(), RunErr> {
+    let (sin, cos) = heading_sin_cos(vm.draw_degrees);
+    let (hx, vy) = step;
+    let turned_x = hx * cos - vy * sin;
+    let turned_y = hx * sin + vy * cos;
+    let scale = f64::from(vm.draw_scale) / 4.0;
+    let aspect = draw_aspect(host.screen);
+    host.screen
+        .move_pen(turned_x * scale, -turned_y * scale * aspect, draw)
+        .map_err(gfx_fault)?;
+    if let Some((x, y)) = saved {
+        host.screen.move_pen_to(x, y, false).map_err(gfx_fault)?;
+    }
+    Ok(())
+}
+
+struct Gml {
+    chars: Vec<char>,
+    i: usize,
+}
+
+impl Gml {
+    fn run(&mut self, vm: &mut Vm, host: &mut Host<'_>, depth: u32) -> Result<(), RunErr> {
+        loop {
+            self.skip_sep();
+            if self.eof() {
+                return Ok(());
+            }
+            let mut blank = false;
+            let mut back = false;
+            loop {
+                self.skip_sep();
+                let Some(letter) = self.peek_upper() else {
+                    return if blank || back {
+                        Err(fault(ILLEGAL, 5))
+                    } else {
+                        Ok(())
+                    };
+                };
+                if letter == 'B' || letter == 'N' {
+                    self.i += 1;
+                    if letter == 'B' {
+                        blank = true;
+                    } else {
+                        back = true;
+                    }
+                    continue;
+                }
+                break;
+            }
+            let cmd = self.pop()?;
+            self.command(vm, host, depth, cmd, (blank, back))?;
+        }
+    }
+
+    fn command(
+        &mut self,
+        vm: &mut Vm,
+        host: &mut Host<'_>,
+        depth: u32,
+        cmd: char,
+        flags: (bool, bool),
+    ) -> Result<(), RunErr> {
+        match cmd {
+            'U' => self.direction(vm, host, (0.0, 1.0), flags),
+            'D' => self.direction(vm, host, (0.0, -1.0), flags),
+            'L' => self.direction(vm, host, (-1.0, 0.0), flags),
+            'R' => self.direction(vm, host, (1.0, 0.0), flags),
+            'E' => self.direction(vm, host, (1.0, 1.0), flags),
+            'F' => self.direction(vm, host, (1.0, -1.0), flags),
+            'G' => self.direction(vm, host, (-1.0, -1.0), flags),
+            'H' => self.direction(vm, host, (-1.0, 1.0), flags),
+            'M' => self.motion(vm, host, flags),
+            'S' => {
+                let n = self.required(vm)?;
+                if !(0..=255).contains(&n) {
+                    return Err(fault(ILLEGAL, 5));
+                }
+                vm.draw_scale = n as u8;
+                Ok(())
+            }
+            'A' => {
+                let n = self.required(vm)?;
+                if !(0..=3).contains(&n) {
+                    return Err(fault(ILLEGAL, 5));
+                }
+                vm.draw_degrees = n as f64 * 90.0;
+                Ok(())
+            }
+            'T' => self.turn_absolute(vm),
+            'C' => {
+                let n = self.required(vm)?;
+                if !(0..=255).contains(&n) {
+                    return Err(fault(ILLEGAL, 5));
+                }
+                host.screen.set_drawing_color(n as u8).map_err(gfx_fault)
+            }
+            'P' => self.paint_here(vm, host),
+            'X' => self.exec_sub(vm, host, depth),
+            _ => Err(fault(ILLEGAL, 5)),
+        }
+    }
+
+    fn direction(
+        &mut self,
+        vm: &mut Vm,
+        host: &mut Host<'_>,
+        unit: (f64, f64),
+        flags: (bool, bool),
+    ) -> Result<(), RunErr> {
+        let count = step_count(self.number(vm, false)?.unwrap_or(1))?;
+        if count == 0 {
+            return Ok(());
+        }
+        let saved = if flags.1 {
+            Some(host.screen.pen())
+        } else {
+            None
+        };
+        let steps = count as f64;
+        stroke(vm, host, (unit.0 * steps, unit.1 * steps), !flags.0, saved)
+    }
+
+    fn motion(
+        &mut self,
+        vm: &mut Vm,
+        host: &mut Host<'_>,
+        flags: (bool, bool),
+    ) -> Result<(), RunErr> {
+        // A sign on x selects a relative step. `M10,-5` stays absolute.
+        let relative = self.leading_sign();
+        let x = self.required(vm)?;
+        self.skip_spaces();
+        if self.peek() != Some(',') {
+            return Err(fault(ILLEGAL, 5));
+        }
+        self.i += 1;
+        let y = self.required(vm)?;
+        let saved = if flags.1 {
+            Some(host.screen.pen())
+        } else {
+            None
+        };
+        if relative {
+            let x = step_count(x)?;
+            let y = step_count(y)?;
+            if x == 0 && y == 0 {
+                return Ok(());
+            }
+            return stroke(vm, host, (x as f64, y as f64), !flags.0, saved);
+        }
+        host.screen
+            .move_pen_to(x as f64, y as f64, !flags.0)
+            .map_err(gfx_fault)?;
+        if let Some((sx, sy)) = saved {
+            host.screen.move_pen_to(sx, sy, false).map_err(gfx_fault)?;
+        }
+        Ok(())
+    }
+
+    fn turn_absolute(&mut self, vm: &mut Vm) -> Result<(), RunErr> {
+        self.skip_spaces();
+        if self.pop()? != 'A' {
+            return Err(fault(ILLEGAL, 5));
+        }
+        let n = self.required(vm)?;
+        if !(-360..=360).contains(&n) {
+            return Err(fault(ILLEGAL, 5));
+        }
+        vm.draw_degrees = n as f64;
+        Ok(())
+    }
+
+    fn paint_here(&mut self, vm: &mut Vm, host: &mut Host<'_>) -> Result<(), RunErr> {
+        let paint = self.required(vm)?;
+        self.skip_spaces();
+        if self.peek() != Some(',') {
+            return Err(fault(ILLEGAL, 5));
+        }
+        self.i += 1;
+        let border = self.required(vm)?;
+        if !(0..=255).contains(&paint) || !(0..=255).contains(&border) {
+            return Err(fault(ILLEGAL, 5));
+        }
+        let (x, y) = host.screen.pen();
+        host.screen
+            .paint_at(x, y, Fill::Solid(paint as u8), Some(border as u8), None)
+            .map_err(gfx_fault)
+    }
+
+    fn exec_sub(&mut self, vm: &mut Vm, host: &mut Host<'_>, depth: u32) -> Result<(), RunErr> {
+        let ident = self.read_name()?;
+        let idx = self.read_indexes(vm)?;
+        self.skip_spaces();
+        if self.peek() != Some(';') {
+            return Err(fault(ILLEGAL, 5));
+        }
+        self.i += 1;
+        let text = need_str(&gml_value(vm, &ident, &idx)?)?;
+        draw_gml(vm, host, &text, depth + 1)
+    }
+
+    fn required(&mut self, vm: &mut Vm) -> Result<i32, RunErr> {
+        self.number(vm, true)?.ok_or_else(|| fault(ILLEGAL, 5))
+    }
+
+    fn number(&mut self, vm: &mut Vm, required: bool) -> Result<Option<i32>, RunErr> {
+        let save = self.i;
+        self.skip_spaces();
+        let mut sign = 1i32;
+        let mut saw_sign = false;
+        match self.peek() {
+            Some('+') => {
+                saw_sign = true;
+                self.i += 1;
+                self.skip_spaces();
+            }
+            Some('-') => {
+                saw_sign = true;
+                sign = -1;
+                self.i += 1;
+                self.skip_spaces();
+            }
+            _ => {}
+        }
+        if self.peek() == Some('=') {
+            self.i += 1;
+            let ident = self.read_name()?;
+            let idx = self.read_indexes(vm)?;
+            self.skip_spaces();
+            if self.peek() != Some(';') {
+                return Err(fault(ILLEGAL, 5));
+            }
+            self.i += 1;
+            let n = i32::from(cint_value(&gml_value(vm, &ident, &idx)?)?);
+            return Ok(Some(apply_sign(sign, i64::from(n))?));
+        }
+        if self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
+            let mut magnitude = 0i64;
+            while let Some(ch) = self.peek() {
+                if !ch.is_ascii_digit() {
+                    break;
+                }
+                let digit = i64::from(u32::from(ch) - u32::from('0'));
+                magnitude = magnitude
+                    .checked_mul(10)
+                    .and_then(|value| value.checked_add(digit))
+                    .ok_or_else(|| fault(OVERFLOW, 6))?;
+                self.i += 1;
+            }
+            return Ok(Some(apply_sign(sign, magnitude)?));
+        }
+        if saw_sign || required {
+            return Err(fault(ILLEGAL, 5));
+        }
+        self.i = save;
+        Ok(None)
+    }
+
+    fn read_name(&mut self) -> Result<Ident, RunErr> {
+        self.skip_spaces();
+        let start = self.i;
+        let Some(first) = self.peek() else {
+            return Err(fault(ILLEGAL, 5));
+        };
+        if !first.is_ascii_alphabetic() {
+            return Err(fault(ILLEGAL, 5));
+        }
+        self.i += 1;
+        while self.peek().is_some_and(|ch| ch.is_ascii_alphanumeric()) {
+            self.i += 1;
+        }
+        if self
+            .peek()
+            .is_some_and(|ch| matches!(ch, '%' | '!' | '#' | '$'))
+        {
+            self.i += 1;
+        }
+        let mut text: String = self.chars[start..self.i].iter().collect();
+        text.make_ascii_uppercase();
+        Ok(Ident::parse(&text))
+    }
+
+    fn read_indexes(&mut self, vm: &mut Vm) -> Result<Vec<i16>, RunErr> {
+        self.skip_spaces();
+        if self.peek() != Some('(') {
+            return Ok(Vec::new());
+        }
+        self.i += 1;
+        let mut idx = Vec::new();
+        loop {
+            let n = self.required(vm)?;
+            if !(-32768..=32767).contains(&n) {
+                return Err(fault(OVERFLOW, 6));
+            }
+            idx.push(n as i16);
+            self.skip_spaces();
+            match self.peek() {
+                Some(',') => self.i += 1,
+                Some(')') => {
+                    self.i += 1;
+                    return Ok(idx);
+                }
+                _ => return Err(fault(ILLEGAL, 5)),
+            }
+        }
+    }
+
+    fn leading_sign(&self) -> bool {
+        let mut j = self.i;
+        while self.chars.get(j) == Some(&' ') {
+            j += 1;
+        }
+        matches!(self.chars.get(j), Some('+' | '-'))
+    }
+
+    fn skip_spaces(&mut self) {
+        while self.peek() == Some(' ') {
+            self.i += 1;
+        }
+    }
+
+    fn skip_sep(&mut self) {
+        while matches!(self.peek(), Some(' ' | ';')) {
+            self.i += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.i).copied()
+    }
+
+    fn peek_upper(&self) -> Option<char> {
+        self.peek().map(|ch| ch.to_ascii_uppercase())
+    }
+
+    fn pop(&mut self) -> Result<char, RunErr> {
+        let ch = self.peek().ok_or_else(|| fault(ILLEGAL, 5))?;
+        self.i += 1;
+        Ok(ch.to_ascii_uppercase())
+    }
+
+    fn eof(&self) -> bool {
+        self.i >= self.chars.len()
+    }
+}
+
+fn apply_sign(sign: i32, magnitude: i64) -> Result<i32, RunErr> {
+    let signed = i64::from(sign) * magnitude;
+    if signed < i64::from(i32::MIN) || signed > i64::from(i32::MAX) {
+        return Err(fault(OVERFLOW, 6));
+    }
+    Ok(signed as i32)
+}
+
 fn exec_dim(
     parser: &mut Parser<'_>,
     mode: Mode,
@@ -4633,6 +5374,7 @@ fn load_ascii(program: &mut Program, text: &str, replace: bool) -> Result<(), &'
         let (number, rest) = numbered_source(line).map_err(|err| err.message)?;
         store_source_line(program, number, rest).map_err(|fault| match fault.kind {
             crate::crunch::FaultKind::Overflow => OVERFLOW,
+            crate::crunch::FaultKind::Missing => MISSING,
             crate::crunch::FaultKind::Syntax => SYNTAX,
         })?;
     }

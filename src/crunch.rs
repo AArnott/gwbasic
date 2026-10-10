@@ -17,6 +17,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum FaultKind {
     Syntax,
     Overflow,
+    /// A statement parsed, then ran out of arguments (`Missing operand`).
+    Missing,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
